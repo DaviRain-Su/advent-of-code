@@ -5,14 +5,32 @@ pub struct Day2 {}
 
 impl Day2 {
     pub fn run(&self) -> anyhow::Result<()> {
-        let input = read_input()?;
+        let input = include_str!("../../data/day2.txt");
         let answer = self.solve(input);
         println!("Answer: {}", answer);
         Ok(())
     }
 
-    pub fn solve(&self, input: Vec<Vec<usize>>) -> usize {
-        input
+    pub fn solve(&self, input: &str) -> usize {
+        // parse string separated by \n and parse each line to usize by whitespace
+        // return a tuple of (usize, usize)
+        let split = input.split("\n").collect::<Vec<&str>>();
+        let split = split
+            .iter()
+            .map(|s| s.split_whitespace())
+            .map(|s| s.collect::<Vec<&str>>())
+            .collect::<Vec<Vec<&str>>>();
+        let split = split
+            .iter()
+            .map(|s| {
+                s.iter()
+                    .map(|s| s.parse::<usize>().unwrap())
+                    .collect::<Vec<usize>>()
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<Vec<usize>>>();
+
+        split
             .into_iter()
             .filter(|v| {
                 // 检查序列是否单调递增或单调递减
@@ -32,38 +50,5 @@ impl Day2 {
                 (increasing || decreasing) && valid_diff
             })
             .count()
-    }
-}
-
-fn read_input() -> anyhow::Result<Vec<Vec<usize>>> {
-    let input = include_str!("../../data/day2.txt");
-    // parse string separated by \n and parse each line to usize by whitespace
-    // return a tuple of (usize, usize)
-    let split = input.split("\n").collect::<Vec<&str>>();
-    let split = split
-        .iter()
-        .map(|s| s.split_whitespace())
-        .map(|s| s.collect::<Vec<&str>>())
-        .collect::<Vec<Vec<&str>>>();
-    let split = split
-        .iter()
-        .map(|s| {
-            s.iter()
-                .map(|s| s.parse::<usize>().unwrap())
-                .collect::<Vec<usize>>()
-        })
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<Vec<usize>>>();
-
-    Ok(split)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_read_input2() {
-        let _input = read_input().unwrap();
     }
 }

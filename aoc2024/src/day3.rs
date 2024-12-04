@@ -8,7 +8,7 @@ impl Day3 {
     pub fn run(&self) -> anyhow::Result<()> {
         let input = include_str!("../../data/day3.txt");
         let result = solve(&input);
-        println!("Result: {}", result);
+        println!("Answer: {}", result);
         Ok(())
     }
 }
