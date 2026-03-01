@@ -16,16 +16,29 @@ pub const Defaults = struct {
     pub const read_tool_type = "function";
     pub const read_file_param = "file_path";
     pub const read_tool_description = "Read and return the contents of a file";
+
+    pub const write_tool_name = "Write";
+    pub const write_content_param = "content";
+    pub const write_tool_description = "Write content to a file";
+
     pub const max_agent_iterations: u8 = 16;
     pub const max_tool_read_bytes: usize = 1024 * 1024;
+    pub const max_tool_write_bytes: usize = 1024 * 1024;
     pub const max_tool_calls_per_iteration: usize = 8;
-    pub const default_tool_allowed_dirs: []const []const u8 = &[_][]const u8{"src"};
+    pub const default_tool_allowed_dirs: []const []const u8 = &[_][]const u8{ "src", "app" };
 };
 
 pub fn maxToolReadBytes() usize {
     const raw = std.posix.getenv("CLAUDE_TOOL_MAX_BYTES") orelse return Defaults.max_tool_read_bytes;
     const parsed = std.fmt.parseInt(usize, raw, 10) catch return Defaults.max_tool_read_bytes;
     return if (parsed == 0) Defaults.max_tool_read_bytes else parsed;
+}
+
+/// Maximum bytes allowed for tool write content.
+pub fn maxToolWriteBytes() usize {
+    const raw = std.posix.getenv("CLAUDE_TOOL_MAX_WRITE_BYTES") orelse return Defaults.max_tool_write_bytes;
+    const parsed = std.fmt.parseInt(usize, raw, 10) catch return Defaults.max_tool_write_bytes;
+    return if (parsed == 0) Defaults.max_tool_write_bytes else parsed;
 }
 
 /// Maximum number of tool calls allowed per assistant message.

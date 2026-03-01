@@ -15,7 +15,10 @@ pub fn buildRequestBody(allocator: std.mem.Allocator, cfg: Config, messages: []c
             description: []const u8,
             parameters: struct {
                 type: []const u8,
-                properties: struct { file_path: struct { type: []const u8, description: []const u8 } },
+                properties: struct {
+                    file_path: struct { type: []const u8, description: []const u8 },
+                    content: struct { type: []const u8, description: []const u8 },
+                },
                 required: []const []const u8,
             },
         },
@@ -27,8 +30,26 @@ pub fn buildRequestBody(allocator: std.mem.Allocator, cfg: Config, messages: []c
                 .description = ConfigMod.Defaults.read_tool_description,
                 .parameters = .{
                     .type = "object",
-                    .properties = .{ .file_path = .{ .type = "string", .description = "The path to the file to read" } },
+                    .properties = .{
+                        .file_path = .{ .type = "string", .description = "The path to the file to read" },
+                        .content = .{ .type = "string", .description = "(unused for read tool)" },
+                    },
                     .required = &[_][]const u8{ConfigMod.Defaults.read_file_param},
+                },
+            },
+        },
+        .{
+            .type = ConfigMod.Defaults.read_tool_type,
+            .function = .{
+                .name = ConfigMod.Defaults.write_tool_name,
+                .description = ConfigMod.Defaults.write_tool_description,
+                .parameters = .{
+                    .type = "object",
+                    .properties = .{
+                        .file_path = .{ .type = "string", .description = "The path of the file to write to" },
+                        .content = .{ .type = "string", .description = "The content to write to the file" },
+                    },
+                    .required = &[_][]const u8{ ConfigMod.Defaults.read_file_param, ConfigMod.Defaults.write_content_param },
                 },
             },
         },

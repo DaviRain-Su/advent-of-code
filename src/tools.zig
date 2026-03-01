@@ -91,6 +91,18 @@ fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return try file.readToEndAlloc(allocator, std.math.maxInt(usize));
 }
 
+fn writeFileAll(path: []const u8, content: []const u8) !void {
+    const max_bytes = ConfigMod.maxToolWriteBytes();
+    if (content.len > max_bytes) {
+        return error.TooLargeToolOutput;
+    }
+
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+
+    try file.pwriteAll(content, 0);
+}
+
 pub fn readRequestedFile(allocator: std.mem.Allocator, diag: *ErrorReport, requested_path: []const u8) ![]u8 {
     if (!isPathAllowedByPolicy(allocator, diag, requested_path)) {
         try diag.setf(.tool, "Tool read path is not allowed: '{s}'", .{requested_path});
@@ -160,6 +172,48 @@ pub fn parseToolArgumentsToPath(allocator: std.mem.Allocator, diag: *ErrorReport
     return try allocator.dupe(u8, file_path);
 }
 
+const ToolWriteArgs = struct {
+    file_path: []const u8,
+    content: []const u8,
+};
+
+fn parseToolArgumentsToWrite(allocator: std.mem.Allocator, diag: *ErrorReport, args_raw: []const u8) !ToolWriteArgs {
+    var parsed_args = std.json.parseFromSlice(std.json.Value, allocator, args_raw, .{}) catch |err| {
+        try diag.setf(.json, "Failed to parse tool arguments JSON: {any}", .{err});
+        return error.JsonError;
+    };
+    defer parsed_args.deinit();
+
+    const args_obj = try Json.asObject(diag, parsed_args.value, "tool_arguments");
+    const file_path = try Json.asString(diag, try Json.field(diag, args_obj, Defaults.read_file_param), "tool_arguments.file_path");
+    const content = try Json.asString(diag, try Json.field(diag, args_obj, Defaults.write_content_param), "tool_arguments.content");
+
+    return ToolWriteArgs{
+        .file_path = try allocator.dupe(u8, file_path),
+        .content = try allocator.dupe(u8, content),
+    };
+}
+
+fn writeRequestedFile(allocator: std.mem.Allocator, diag: *ErrorReport, requested_path: []const u8, content: []const u8) ![]u8 {
+    if (!isPathAllowedByPolicy(allocator, diag, requested_path)) {
+        try diag.setf(.tool, "Tool write path is not allowed: '{s}'", .{requested_path});
+        return error.InvalidToolArguments;
+    }
+
+    writeFileAll(requested_path, content) catch |err| switch (err) {
+        error.TooLargeToolOutput => {
+            try diag.setf(.tool, "Tool write content exceeds size limit", .{});
+            return err;
+        },
+        else => {
+            try diag.setf(.filesystem, "Failed to write '{s}': {any}", .{ requested_path, err });
+            return error.FileSystemError;
+        },
+    };
+
+    return try std.fmt.allocPrint(allocator, "Wrote {d} bytes to '{s}'", .{ content.len, requested_path });
+}
+
 pub fn parseAssistantMessage(allocator: std.mem.Allocator, diag: *ErrorReport, message_obj: std.json.ObjectMap) !Models.ParsedAssistantMessage {
     var content: ?[]const u8 = null;
     if (message_obj.get("content")) |content_raw| {
@@ -204,7 +258,9 @@ pub fn parseAssistantMessage(allocator: std.mem.Allocator, diag: *ErrorReport, m
 
                     const function_obj = try Json.asObject(diag, try Json.field(diag, call_obj, "function"), "assistant.message.tool_calls[].function");
                     const function_name = try Json.asString(diag, try Json.field(diag, function_obj, "name"), "assistant.message.tool_calls[].function.name");
-                    if (!std.mem.eql(u8, function_name, Defaults.read_tool_name)) {
+                    if (!std.mem.eql(u8, function_name, Defaults.read_tool_name) and
+                        !std.mem.eql(u8, function_name, Defaults.write_tool_name))
+                    {
                         try diag.setf(.tool, "Unsupported tool function '{s}'", .{function_name});
                         return error.UnsupportedFunction;
                     }
@@ -236,23 +292,45 @@ pub fn parseAssistantMessage(allocator: std.mem.Allocator, diag: *ErrorReport, m
 
 pub fn executeToolCall(allocator: std.mem.Allocator, diag: *ErrorReport, call_index: usize, tool_call: Models.ToolCall) ![]u8 {
     const function = tool_call.function;
-    if (!std.mem.eql(u8, function.name, Defaults.read_tool_name)) {
-        try diag.setf(.tool, "Unsupported tool call #{d} (id={s}): function '{s}' is not supported", .{
-            call_index,
-            tool_call.id,
-            function.name,
-        });
-        return error.UnsupportedFunction;
+
+    if (std.mem.eql(u8, function.name, Defaults.read_tool_name)) {
+        const file_path = parseToolArgumentsToPath(allocator, diag, function.arguments) catch |err| {
+            try diag.setf(.tool, "Tool call #{d} (id={s}) arguments are invalid: {any}", .{ call_index, tool_call.id, err });
+            return err;
+        };
+        defer allocator.free(file_path);
+
+        return readRequestedFile(allocator, diag, file_path) catch |err| {
+            try diag.setf(.tool, "Tool call #{d} (id={s}) failed to read '{s}': {any}", .{ call_index, tool_call.id, file_path, err });
+            return err;
+        };
     }
 
-    const file_path = parseToolArgumentsToPath(allocator, diag, function.arguments) catch |err| {
-        try diag.setf(.tool, "Tool call #{d} (id={s}) arguments are invalid: {any}", .{ call_index, tool_call.id, err });
-        return err;
-    };
-    defer allocator.free(file_path);
+    if (std.mem.eql(u8, function.name, Defaults.write_tool_name)) {
+        const write_args = parseToolArgumentsToWrite(allocator, diag, function.arguments) catch |err| {
+            try diag.setf(.tool, "Tool call #{d} (id={s}) arguments are invalid: {any}", .{ call_index, tool_call.id, err });
+            return err;
+        };
+        defer {
+            allocator.free(write_args.file_path);
+            allocator.free(write_args.content);
+        }
 
-    return readRequestedFile(allocator, diag, file_path) catch |err| {
-        try diag.setf(.tool, "Tool call #{d} (id={s}) failed to read '{s}': {any}", .{ call_index, tool_call.id, file_path, err });
-        return err;
-    };
+        return writeRequestedFile(allocator, diag, write_args.file_path, write_args.content) catch |err| {
+            if (err == error.TooLargeToolOutput) {
+                try diag.setf(.tool, "Tool call #{d} (id={s}) failed to write '{s}': content too large", .{ call_index, tool_call.id, write_args.file_path });
+                return err;
+            }
+
+            try diag.setf(.tool, "Tool call #{d} (id={s}) failed to write '{s}': {any}", .{ call_index, tool_call.id, write_args.file_path, err });
+            return err;
+        };
+    }
+
+    try diag.setf(.tool, "Unsupported tool call #{d} (id={s}): function '{s}' is not supported", .{
+        call_index,
+        tool_call.id,
+        function.name,
+    });
+    return error.UnsupportedFunction;
 }
