@@ -21,9 +21,14 @@ pub const Defaults = struct {
     pub const write_content_param = "content";
     pub const write_tool_description = "Write content to a file";
 
+    pub const bash_tool_name = "Bash";
+    pub const bash_command_param = "command";
+    pub const bash_tool_description = "Execute a shell command";
+
     pub const max_agent_iterations: u8 = 16;
     pub const max_tool_read_bytes: usize = 1024 * 1024;
     pub const max_tool_write_bytes: usize = 1024 * 1024;
+    pub const max_tool_bash_output_bytes: usize = 128 * 1024;
     pub const max_tool_calls_per_iteration: usize = 8;
     pub const default_tool_allowed_dirs: []const []const u8 = &[_][]const u8{ "src", "app" };
 };
@@ -39,6 +44,13 @@ pub fn maxToolWriteBytes() usize {
     const raw = std.posix.getenv("CLAUDE_TOOL_MAX_WRITE_BYTES") orelse return Defaults.max_tool_write_bytes;
     const parsed = std.fmt.parseInt(usize, raw, 10) catch return Defaults.max_tool_write_bytes;
     return if (parsed == 0) Defaults.max_tool_write_bytes else parsed;
+}
+
+/// Maximum bytes captured from Bash tool output.
+pub fn maxToolBashOutputBytes() usize {
+    const raw = std.posix.getenv("CLAUDE_TOOL_MAX_BASH_OUTPUT_BYTES") orelse return Defaults.max_tool_bash_output_bytes;
+    const parsed = std.fmt.parseInt(usize, raw, 10) catch return Defaults.max_tool_bash_output_bytes;
+    return if (parsed == 0) Defaults.max_tool_bash_output_bytes else parsed;
 }
 
 /// Maximum number of tool calls allowed per assistant message.

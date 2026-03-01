@@ -16,8 +16,9 @@ pub fn buildRequestBody(allocator: std.mem.Allocator, cfg: Config, messages: []c
             parameters: struct {
                 type: []const u8,
                 properties: struct {
-                    file_path: struct { type: []const u8, description: []const u8 },
+                    file_path: ?struct { type: []const u8, description: []const u8 } = null,
                     content: ?struct { type: []const u8, description: []const u8 } = null,
+                    command: ?struct { type: []const u8, description: []const u8 } = null,
                 },
                 required: []const []const u8,
             },
@@ -33,6 +34,7 @@ pub fn buildRequestBody(allocator: std.mem.Allocator, cfg: Config, messages: []c
                     .properties = .{
                         .file_path = .{ .type = "string", .description = "The path to the file to read" },
                         .content = null,
+                        .command = null,
                     },
                     .required = &[_][]const u8{ConfigMod.Defaults.read_file_param},
                 },
@@ -48,8 +50,25 @@ pub fn buildRequestBody(allocator: std.mem.Allocator, cfg: Config, messages: []c
                     .properties = .{
                         .file_path = .{ .type = "string", .description = "The path of the file to write to" },
                         .content = .{ .type = "string", .description = "The content to write to the file" },
+                        .command = null,
                     },
                     .required = &[_][]const u8{ ConfigMod.Defaults.read_file_param, ConfigMod.Defaults.write_content_param },
+                },
+            },
+        },
+        .{
+            .type = ConfigMod.Defaults.read_tool_type,
+            .function = .{
+                .name = ConfigMod.Defaults.bash_tool_name,
+                .description = ConfigMod.Defaults.bash_tool_description,
+                .parameters = .{
+                    .type = "object",
+                    .properties = .{
+                        .file_path = null,
+                        .content = null,
+                        .command = .{ .type = "string", .description = "The command to execute" },
+                    },
+                    .required = &[_][]const u8{ConfigMod.Defaults.bash_command_param},
                 },
             },
         },

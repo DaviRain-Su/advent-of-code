@@ -22,6 +22,7 @@ pub fn main() !void {
             error.InvalidToolArguments,
             error.TooLargeToolOutput,
             error.TooManyToolCalls,
+            error.ToolExecutionFailed,
             error.UnsupportedFunction,
             error.NoChoices,
             error.RequestedFileNotFound,

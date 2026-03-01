@@ -107,6 +107,63 @@ fn writeFileAll(path: []const u8, content: []const u8) !void {
     try file.pwriteAll(content, 0);
 }
 
+fn buildBashOutput(allocator: std.mem.Allocator, stdout: []const u8, stderr: []const u8, term: std.process.Child.Term) ![]u8 {
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                try out.writer(allocator).print("Command exited with code {d}\n", .{code});
+            }
+        },
+        .Signal => |sig| {
+            try out.writer(allocator).print("Command terminated by signal {d}\n", .{sig});
+        },
+        .Stopped => |sig| {
+            try out.writer(allocator).print("Command stopped by signal {d}\n", .{sig});
+        },
+        .Unknown => |val| {
+            try out.writer(allocator).print("Command ended with status {d}\n", .{val});
+        },
+    }
+
+    if (stdout.len > 0) {
+        try out.appendSlice(allocator, stdout);
+    }
+
+    if (stderr.len > 0) {
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') {
+            try out.append(allocator, '\n');
+        }
+        try out.appendSlice(allocator, stderr);
+    }
+
+    if (out.items.len == 0) {
+        return allocator.dupe(u8, "");
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn runBashCommand(allocator: std.mem.Allocator, diag: *ErrorReport, command: []const u8) ![]u8 {
+    const max_output = ConfigMod.maxToolBashOutputBytes();
+    const argv = [_][]const u8{ "bash", "-lc", command };
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &argv,
+        .max_output_bytes = max_output,
+    }) catch |err| {
+        try diag.setf(.tool, "Bash command failed to run: {any}", .{err});
+        return error.ToolExecutionFailed;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    return buildBashOutput(allocator, result.stdout, result.stderr, result.term);
+}
+
 pub fn readRequestedFile(allocator: std.mem.Allocator, diag: *ErrorReport, requested_path: []const u8) ![]u8 {
     if (!isPathAllowedByPolicy(allocator, diag, requested_path)) {
         try diag.setf(.tool, "Tool read path is not allowed: '{s}'", .{requested_path});
@@ -198,6 +255,23 @@ fn parseToolArgumentsToWrite(allocator: std.mem.Allocator, diag: *ErrorReport, a
     };
 }
 
+const ToolBashArgs = struct {
+    command: []const u8,
+};
+
+fn parseToolArgumentsToBash(allocator: std.mem.Allocator, diag: *ErrorReport, args_raw: []const u8) !ToolBashArgs {
+    var parsed_args = std.json.parseFromSlice(std.json.Value, allocator, args_raw, .{}) catch |err| {
+        try diag.setf(.json, "Failed to parse tool arguments JSON: {any}", .{err});
+        return error.JsonError;
+    };
+    defer parsed_args.deinit();
+
+    const args_obj = try Json.asObject(diag, parsed_args.value, "tool_arguments");
+    const command = try Json.asString(diag, try Json.field(diag, args_obj, Defaults.bash_command_param), "tool_arguments.command");
+
+    return ToolBashArgs{ .command = try allocator.dupe(u8, command) };
+}
+
 fn writeRequestedFile(allocator: std.mem.Allocator, diag: *ErrorReport, requested_path: []const u8, content: []const u8) ![]u8 {
     if (!isPathAllowedByPolicy(allocator, diag, requested_path)) {
         try diag.setf(.tool, "Tool write path is not allowed: '{s}'", .{requested_path});
@@ -263,7 +337,8 @@ pub fn parseAssistantMessage(allocator: std.mem.Allocator, diag: *ErrorReport, m
                     const function_obj = try Json.asObject(diag, try Json.field(diag, call_obj, "function"), "assistant.message.tool_calls[].function");
                     const function_name = try Json.asString(diag, try Json.field(diag, function_obj, "name"), "assistant.message.tool_calls[].function.name");
                     if (!std.mem.eql(u8, function_name, Defaults.read_tool_name) and
-                        !std.mem.eql(u8, function_name, Defaults.write_tool_name))
+                        !std.mem.eql(u8, function_name, Defaults.write_tool_name) and
+                        !std.mem.eql(u8, function_name, Defaults.bash_tool_name))
                     {
                         try diag.setf(.tool, "Unsupported tool function '{s}'", .{function_name});
                         return error.UnsupportedFunction;
@@ -327,6 +402,19 @@ pub fn executeToolCall(allocator: std.mem.Allocator, diag: *ErrorReport, call_in
             }
 
             try diag.setf(.tool, "Tool call #{d} (id={s}) failed to write '{s}': {any}", .{ call_index, tool_call.id, write_args.file_path, err });
+            return err;
+        };
+    }
+
+    if (std.mem.eql(u8, function.name, Defaults.bash_tool_name)) {
+        const bash_args = parseToolArgumentsToBash(allocator, diag, function.arguments) catch |err| {
+            try diag.setf(.tool, "Tool call #{d} (id={s}) arguments are invalid: {any}", .{ call_index, tool_call.id, err });
+            return err;
+        };
+        defer allocator.free(bash_args.command);
+
+        return runBashCommand(allocator, diag, bash_args.command) catch |err| {
+            try diag.setf(.tool, "Tool call #{d} (id={s}) failed to run bash command: {any}", .{ call_index, tool_call.id, err });
             return err;
         };
     }
