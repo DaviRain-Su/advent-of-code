@@ -19,9 +19,9 @@ pub const Defaults = struct {
     pub const max_agent_iterations: u8 = 16;
     pub const max_tool_read_bytes: usize = 1024 * 1024;
     pub const max_tool_calls_per_iteration: usize = 8;
+    pub const default_tool_allowed_dirs: []const []const u8 = &[_][]const u8{"src"};
 };
 
-/// Maximum bytes returned by tool file reads.
 pub fn maxToolReadBytes() usize {
     const raw = std.posix.getenv("CLAUDE_TOOL_MAX_BYTES") orelse return Defaults.max_tool_read_bytes;
     const parsed = std.fmt.parseInt(usize, raw, 10) catch return Defaults.max_tool_read_bytes;
@@ -34,6 +34,58 @@ pub fn maxToolCallsPerIteration() usize {
     const parsed = std.fmt.parseInt(usize, raw, 10) catch return Defaults.max_tool_calls_per_iteration;
     if (parsed == 0) return Defaults.max_tool_calls_per_iteration;
     return parsed;
+}
+
+/// Return configured allowed directories for `Read` tool path inputs.
+pub fn allowedToolDirs(allocator: std.mem.Allocator) ![][]const u8 {
+    const raw = std.posix.getenv("CLAUDE_TOOL_ALLOWED_DIRS") orelse {
+        return try cloneStringSlice(allocator, Defaults.default_tool_allowed_dirs);
+    };
+
+    var out = std.ArrayList([]const u8){};
+    errdefer {
+        for (out.items) |item| {
+            allocator.free(item);
+        }
+        out.deinit(allocator);
+    }
+
+    var it = std.mem.splitAny(u8, raw, ",");
+    while (it.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try out.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+
+    if (out.items.len == 0) {
+        return try cloneStringSlice(allocator, Defaults.default_tool_allowed_dirs);
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Release a list allocated by allowedToolDirs.
+pub fn freeStringList(allocator: std.mem.Allocator, list: [][]const u8) void {
+    for (list) |item| {
+        allocator.free(item);
+    }
+    allocator.free(list);
+}
+
+fn cloneStringSlice(allocator: std.mem.Allocator, values: []const []const u8) ![][]const u8 {
+    var out = std.ArrayList([]const u8){};
+    errdefer {
+        for (out.items) |item| {
+            allocator.free(item);
+        }
+        out.deinit(allocator);
+    }
+
+    for (values) |value| {
+        try out.append(allocator, try allocator.dupe(u8, value));
+    }
+
+    return try out.toOwnedSlice(allocator);
 }
 
 /// Enable verbose diagnostics for request/response lifecycle tracing.

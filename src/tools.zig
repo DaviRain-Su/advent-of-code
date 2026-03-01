@@ -41,7 +41,36 @@ fn isUnsafeToolPath(path: []const u8) bool {
 
     var it = std.mem.splitAny(u8, path, "/\\");
     while (it.next()) |segment| {
+        if (segment.len == 0) continue;
+        if (segment.len == 1 and std.mem.eql(u8, segment, ".")) {
+            return true;
+        }
         if (segment.len == 2 and std.mem.eql(u8, segment, "..")) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn isPathAllowedByPolicy(allocator: std.mem.Allocator, diag: *ErrorReport, path: []const u8) bool {
+    if (isUnsafeToolPath(path)) return false;
+
+    const first_sep = std.mem.indexOfAny(u8, path, "/\\");
+    if (first_sep == null) {
+        // Keep compatibility for bare filenames: these are handled by direct and src/ fallback logic.
+        return true;
+    }
+
+    const top_dir = path[0..first_sep.?];
+    const allowed_dirs = ConfigMod.allowedToolDirs(allocator) catch |err| {
+        diag.setf(.config, "Cannot parse CLAUDE_TOOL_ALLOWED_DIRS: {any}", .{err}) catch {};
+        return false;
+    };
+    defer ConfigMod.freeStringList(allocator, allowed_dirs);
+
+    for (allowed_dirs) |dir| {
+        if (std.mem.eql(u8, top_dir, dir)) {
             return true;
         }
     }
@@ -63,7 +92,7 @@ fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 pub fn readRequestedFile(allocator: std.mem.Allocator, diag: *ErrorReport, requested_path: []const u8) ![]u8 {
-    if (isUnsafeToolPath(requested_path)) {
+    if (!isPathAllowedByPolicy(allocator, diag, requested_path)) {
         try diag.setf(.tool, "Tool read path is not allowed: '{s}'", .{requested_path});
         return error.InvalidToolArguments;
     }
@@ -94,6 +123,11 @@ pub fn readRequestedFile(allocator: std.mem.Allocator, diag: *ErrorReport, reque
 
     const src_path = try std.fmt.allocPrint(allocator, "src/{s}", .{requested_path});
     defer allocator.free(src_path);
+
+    if (!isPathAllowedByPolicy(allocator, diag, src_path)) {
+        try diag.setf(.tool, "Tool read path is not allowed: '{s}'", .{src_path});
+        return error.InvalidToolArguments;
+    }
 
     const from_src = readFileAll(allocator, src_path) catch |err| switch (err) {
         error.FileNotFound => null,
