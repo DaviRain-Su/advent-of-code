@@ -22,8 +22,16 @@ pub fn main() !void {
     var jw: std.json.Stringify = .{ .writer = &body_out.writer };
     try jw.write(.{
         .model = "anthropic/claude-haiku-4.5",
+        //.model = "deepseek-chat",
         .messages = &[_]struct { role: []const u8, content: []const u8 }{
             .{ .role = "user", .content = prompt_str },
+        },
+        .tools = &[_]struct { type: []const u8, function: struct { name: []const u8, description: []const u8, parameters: struct {
+            type: []const u8,
+            properties: struct { file_path: struct { type: []const u8, description: []const u8 } },
+            required: []const []const u8,
+        } } }{
+            .{ .type = "function", .function = .{ .name = "Read", .description = "Read and return the contents of a file", .parameters = .{ .type = "object", .properties = .{ .file_path = .{ .type = "string", .description = "The path to the file to read" } }, .required = &[_][]const u8{"file_path"} } } },
         },
     });
     const body = body_out.written();
