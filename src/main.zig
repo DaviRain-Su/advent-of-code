@@ -15,6 +15,7 @@ const AppError = error{
     HttpError,
     JsonError,
     ApiError,
+    AgentLoopExceeded,
 };
 
 const ErrorCategory = enum {
@@ -93,14 +94,32 @@ const Defaults = struct {
     const default_deepseek_model = "deepseek-chat";
 
     const read_tool_name = "Read";
+    const read_tool_type = "function";
     const read_file_param = "file_path";
     const read_tool_description = "Read and return the contents of a file";
 };
 
-const AssistantAction = union(enum) {
-    read_file: []const u8,
-    reply_text: []const u8,
-    none,
+const ToolFunction = struct {
+    name: []const u8,
+    arguments: []const u8,
+};
+
+const ToolCall = struct {
+    id: []const u8,
+    type: []const u8,
+    function: ToolFunction,
+};
+
+const Message = struct {
+    role: []const u8,
+    content: ?[]const u8 = null,
+    tool_calls: ?[]const ToolCall = null,
+    tool_call_id: ?[]const u8 = null,
+};
+
+const ParsedAssistantMessage = struct {
+    content: ?[]const u8,
+    tool_calls: ?[]const ToolCall,
 };
 
 const Json = struct {
@@ -218,17 +237,13 @@ fn readRequestedFile(allocator: std.mem.Allocator, diag: *ErrorReport, requested
     return error.RequestedFileNotFound;
 }
 
-fn buildRequestBody(allocator: std.mem.Allocator, model: []const u8, prompt: []const u8) ![]u8 {
+fn buildRequestBody(allocator: std.mem.Allocator, cfg: Config, messages: []const Message) ![]u8 {
     var body_out: std.io.Writer.Allocating = .init(allocator);
     defer body_out.deinit();
 
-    var json_writer = std.json.Stringify{ .writer = &body_out.writer };
-    try json_writer.write(.{
-        .model = model,
-        .messages = &[_]struct { role: []const u8, content: []const u8 }{
-            .{ .role = "user", .content = prompt },
-        },
-        .tools = &[_]struct { type: []const u8, function: struct {
+    const tools = [_]struct {
+        type: []const u8,
+        function: struct {
             name: []const u8,
             description: []const u8,
             parameters: struct {
@@ -236,8 +251,11 @@ fn buildRequestBody(allocator: std.mem.Allocator, model: []const u8, prompt: []c
                 properties: struct { file_path: struct { type: []const u8, description: []const u8 } },
                 required: []const []const u8,
             },
-        } }{
-            .{ .type = "function", .function = .{
+        },
+    }{
+        .{
+            .type = "function",
+            .function = .{
                 .name = Defaults.read_tool_name,
                 .description = Defaults.read_tool_description,
                 .parameters = .{
@@ -245,15 +263,22 @@ fn buildRequestBody(allocator: std.mem.Allocator, model: []const u8, prompt: []c
                     .properties = .{ .file_path = .{ .type = "string", .description = "The path to the file to read" } },
                     .required = &[_][]const u8{Defaults.read_file_param},
                 },
-            } },
+            },
         },
+    };
+
+    var json_writer = std.json.Stringify{ .writer = &body_out.writer, .options = .{ .emit_null_optional_fields = false } };
+    try json_writer.write(.{
+        .model = cfg.model,
+        .messages = messages,
+        .tools = &tools,
     });
 
     return try allocator.dupe(u8, body_out.written());
 }
 
-fn sendCompletionRequest(allocator: std.mem.Allocator, diag: *ErrorReport, cfg: Config, prompt: []const u8) ![]u8 {
-    const body = try buildRequestBody(allocator, cfg.model, prompt);
+fn sendCompletionRequest(allocator: std.mem.Allocator, diag: *ErrorReport, cfg: Config, messages: []const Message) ![]u8 {
+    const body = try buildRequestBody(allocator, cfg, messages);
     defer allocator.free(body);
 
     const url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{cfg.base_url});
@@ -328,75 +353,131 @@ fn checkApiError(diag: *ErrorReport, response_obj: std.json.ObjectMap) !void {
     return error.ApiError;
 }
 
-fn parseReadToolPath(allocator: std.mem.Allocator, diag: *ErrorReport, tool_calls: std.json.Value) ![]const u8 {
-    const tool_call_list = try Json.asArray(diag, tool_calls, "tool_calls");
-
-    if (tool_call_list.items.len == 0) {
-        diag.setBorrowed(.tool, "tool_calls array is empty");
-        return error.EmptyToolCalls;
+fn freeToolCallList(allocator: std.mem.Allocator, calls: []const ToolCall) void {
+    for (calls) |*call| {
+        allocator.free(call.id);
+        allocator.free(call.type);
+        allocator.free(call.function.name);
+        allocator.free(call.function.arguments);
     }
 
-    const first_tool_call = try Json.asObject(diag, tool_call_list.items[0], "tool_calls[0]");
-    const function_obj = try Json.asObject(diag, try Json.field(diag, first_tool_call, "function"), "tool_calls[0].function");
-    const function_name = try Json.asString(diag, try Json.field(diag, function_obj, "name"), "tool_calls[0].function.name");
+    if (calls.len > 0) {
+        allocator.free(calls);
+    }
+}
 
-    if (!std.mem.eql(u8, function_name, Defaults.read_tool_name)) {
-        try diag.setf(.tool, "Unsupported tool function '{s}'", .{function_name});
-        return error.UnsupportedFunction;
+fn freeConversationMessage(allocator: std.mem.Allocator, message: *Message) void {
+    if (message.content) |content| {
+        allocator.free(content);
     }
 
-    const args_raw = try Json.asString(diag, try Json.field(diag, function_obj, "arguments"), "tool_calls[0].function.arguments");
+    if (message.tool_call_id) |tool_call_id| {
+        allocator.free(tool_call_id);
+    }
+
+    if (message.tool_calls) |tool_calls| {
+        freeToolCallList(allocator, tool_calls);
+    }
+}
+
+fn parseToolArgumentsToPath(allocator: std.mem.Allocator, diag: *ErrorReport, args_raw: []const u8) ![]const u8 {
     var parsed_args = std.json.parseFromSlice(std.json.Value, allocator, args_raw, .{}) catch |err| {
         try diag.setf(.json, "Failed to parse tool arguments JSON: {any}", .{err});
         return error.JsonError;
     };
     defer parsed_args.deinit();
 
-    const args_obj = try Json.asObject(diag, parsed_args.value, "tool_calls[0].function.arguments");
-    const file_path = try Json.asString(diag, try Json.field(diag, args_obj, Defaults.read_file_param), "tool_calls[0].function.arguments.file_path");
+    const args_obj = try Json.asObject(diag, parsed_args.value, "tool_arguments");
+    const file_path = try Json.asString(diag, try Json.field(diag, args_obj, Defaults.read_file_param), "tool_arguments.file_path");
 
     return try allocator.dupe(u8, file_path);
 }
 
-fn parseAssistantAction(allocator: std.mem.Allocator, diag: *ErrorReport, message: std.json.ObjectMap) !AssistantAction {
-    if (message.get("tool_calls")) |tool_calls| {
-        if (tool_calls == .null) return .none;
-
-        if (tool_calls != .array) {
-            diag.setBorrowed(.tool, "tool_calls exists but is not an array");
-            return error.InvalidToolCallsShape;
-        }
-
-        const file_path = try parseReadToolPath(allocator, diag, tool_calls);
-        return .{ .read_file = file_path };
-    }
-
-    if (message.get("content")) |content| {
-        if (content == .string) {
-            return .{ .reply_text = content.string };
+fn parseAssistantMessage(allocator: std.mem.Allocator, diag: *ErrorReport, message_obj: std.json.ObjectMap) !ParsedAssistantMessage {
+    var content: ?[]const u8 = null;
+    if (message_obj.get("content")) |content_raw| {
+        switch (content_raw) {
+            .string => content = try allocator.dupe(u8, content_raw.string),
+            .null => content = null,
+            else => {
+                try diag.setf(.json, "Expected assistant content to be a string or null, got {any}", .{content_raw});
+                return error.InvalidType;
+            },
         }
     }
 
-    return .none;
+    var tool_calls_out: ?[]const ToolCall = null;
+
+    if (message_obj.get("tool_calls")) |tool_calls_raw| {
+        if (tool_calls_raw != .null) {
+            const tool_call_array = try Json.asArray(diag, tool_calls_raw, "assistant.message.tool_calls");
+
+            if (tool_call_array.items.len == 0) {
+                tool_calls_out = null;
+            } else {
+                var calls = std.ArrayList(ToolCall){};
+                errdefer {
+                    for (calls.items) |*call| {
+                        allocator.free(call.function.name);
+                        allocator.free(call.function.arguments);
+                        allocator.free(call.id);
+                        allocator.free(call.type);
+                    }
+                    calls.deinit(allocator);
+                }
+
+                for (tool_call_array.items) |item| {
+                    const call_obj = try Json.asObject(diag, item, "assistant.message.tool_calls[]");
+                    const call_id_raw = try Json.asString(diag, try Json.field(diag, call_obj, "id"), "assistant.message.tool_calls[].id");
+                    const call_type = try Json.asString(diag, try Json.field(diag, call_obj, "type"), "assistant.message.tool_calls[].type");
+                    if (!std.mem.eql(u8, call_type, Defaults.read_tool_type)) {
+                        try diag.setf(.tool, "Unsupported tool call type '{s}'", .{call_type});
+                        return error.InvalidToolCallsShape;
+                    }
+
+                    const function_obj = try Json.asObject(diag, try Json.field(diag, call_obj, "function"), "assistant.message.tool_calls[].function");
+                    const function_name = try Json.asString(diag, try Json.field(diag, function_obj, "name"), "assistant.message.tool_calls[].function.name");
+                    if (!std.mem.eql(u8, function_name, Defaults.read_tool_name)) {
+                        try diag.setf(.tool, "Unsupported tool function '{s}'", .{function_name});
+                        return error.UnsupportedFunction;
+                    }
+
+                    const args_raw = try Json.asString(diag, try Json.field(diag, function_obj, "arguments"), "assistant.message.tool_calls[].function.arguments");
+
+                    try calls.append(allocator, .{
+                        .id = try allocator.dupe(u8, call_id_raw),
+                        .type = try allocator.dupe(u8, call_type),
+                        .function = .{
+                            .name = try allocator.dupe(u8, function_name),
+                            .arguments = try allocator.dupe(u8, args_raw),
+                        },
+                    });
+                }
+
+                if (calls.items.len == 0) {
+                    calls.deinit(allocator);
+                    tool_calls_out = null;
+                } else {
+                    tool_calls_out = try calls.toOwnedSlice(allocator);
+                }
+            }
+        }
+    }
+
+    return .{ .content = content, .tool_calls = tool_calls_out };
 }
 
-fn freeAssistantAction(allocator: std.mem.Allocator, action: AssistantAction) void {
-    switch (action) {
-        .read_file => |path| allocator.free(path),
-        else => {},
+fn executeToolCall(allocator: std.mem.Allocator, diag: *ErrorReport, tool_call: ToolCall) ![]u8 {
+    const function = tool_call.function;
+    if (!std.mem.eql(u8, function.name, Defaults.read_tool_name)) {
+        try diag.setf(.tool, "Unsupported tool function '{s}'", .{function.name});
+        return error.UnsupportedFunction;
     }
-}
 
-fn executeAssistantAction(allocator: std.mem.Allocator, diag: *ErrorReport, action: AssistantAction) !void {
-    switch (action) {
-        .none => {},
-        .reply_text => |text| try writeAll(diag, text),
-        .read_file => |path| {
-            const file_contents = readRequestedFile(allocator, diag, path) catch |err| return err;
-            defer allocator.free(file_contents);
-            try writeAll(diag, file_contents);
-        },
-    }
+    const file_path = try parseToolArgumentsToPath(allocator, diag, function.arguments);
+    defer allocator.free(file_path);
+
+    return try readRequestedFile(allocator, diag, file_path);
 }
 
 fn formatErrorCategory(kind: ErrorCategory) []const u8 {
@@ -412,25 +493,6 @@ fn formatErrorCategory(kind: ErrorCategory) []const u8 {
         .validation => "Validation Error",
         .unexpected => "Unexpected Error",
         .none => "Error",
-    };
-}
-
-fn formatBaseMessage(err: AppError) []const u8 {
-    return switch (err) {
-        .UsageError => "Usage error",
-        .MissingApiKey => "OpenRouter API key is required",
-        .MissingField => "Malformed provider response (missing expected JSON field)",
-        .InvalidType => "Malformed provider response (unexpected JSON type)",
-        .InvalidToolCallsShape => "Malformed tool-calls payload shape",
-        .EmptyToolCalls => "Tool calls array is empty",
-        .UnsupportedFunction => "Unsupported tool function",
-        .NoChoices => "Provider returned no choices",
-        .RequestedFileNotFound => "Requested file was not found",
-        .FileSystemError => "Could not read file from filesystem",
-        .WriteFailed => "Failed to write assistant output",
-        .HttpError => "Provider request failed",
-        .JsonError => "Failed to parse provider response",
-        .ApiError => "Provider returned an API error",
     };
 }
 
@@ -451,12 +513,14 @@ fn userFacingMessage(allocator: std.mem.Allocator, err: anyerror, report: *Error
         error.HttpError => "Provider request failed",
         error.JsonError => "Failed to parse provider response",
         error.ApiError => "Provider returned an API error",
+        error.AgentLoopExceeded => "Agent loop exceeded safety limit",
         else => "Unexpected runtime error",
     };
 
     if (report.detail) |detail| {
         return try std.fmt.allocPrint(allocator, "[{s}] {s}: {s}", .{ category, base, detail });
     }
+
     return try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ category, base });
 }
 
@@ -480,39 +544,77 @@ fn run(diag: *ErrorReport) !void {
         return err;
     };
 
-    const response_body = sendCompletionRequest(allocator, diag, config, prompt) catch |err| {
-        switch (err) {
-            error.HttpError => return err,
-            else => {
-                diag.setf(.network, "Unexpected network error: {any}", .{err}) catch {};
-                return error.HttpError;
-            },
+    var messages = std.ArrayList(Message){};
+    defer {
+        for (messages.items) |*msg| {
+            freeConversationMessage(allocator, msg);
         }
-    };
-    defer allocator.free(response_body);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch |err| {
-        try diag.setf(.json, "Unable to decode provider JSON response body: {any}", .{err});
-        return error.JsonError;
-    };
-    defer parsed.deinit();
-
-    const response_obj = try Json.asObject(diag, parsed.value, "response");
-    try checkApiError(diag, response_obj);
-
-    const choices = try Json.asArray(diag, try Json.field(diag, response_obj, "choices"), "response.choices");
-    if (choices.items.len == 0) {
-        diag.setBorrowed(.validation, "No choices were returned in API response");
-        return error.NoChoices;
+        messages.deinit(allocator);
     }
 
-    const first_choice = try Json.asObject(diag, choices.items[0], "response.choices[0]");
-    const message = try Json.asObject(diag, try Json.field(diag, first_choice, "message"), "response.choices[0].message");
+    try messages.append(allocator, .{ .role = "user", .content = try allocator.dupe(u8, prompt) });
 
-    const action = parseAssistantAction(allocator, diag, message) catch |err| return err;
-    defer freeAssistantAction(allocator, action);
+    var iterations: u8 = 0;
+    while (iterations < 16) : (iterations += 1) {
+        const response_body = sendCompletionRequest(allocator, diag, config, messages.items) catch |err| {
+            switch (err) {
+                error.HttpError => return err,
+                else => {
+                    diag.setf(.network, "Unexpected network error: {any}", .{err}) catch {};
+                    return error.HttpError;
+                },
+            }
+        };
+        defer allocator.free(response_body);
 
-    try executeAssistantAction(allocator, diag, action);
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch |err| {
+            try diag.setf(.json, "Unable to decode provider JSON response body: {any}", .{err});
+            return error.JsonError;
+        };
+        defer parsed.deinit();
+
+        const response_obj = try Json.asObject(diag, parsed.value, "response");
+        try checkApiError(diag, response_obj);
+
+        const choices = try Json.asArray(diag, try Json.field(diag, response_obj, "choices"), "response.choices");
+        if (choices.items.len == 0) {
+            diag.setBorrowed(.validation, "No choices were returned in API response");
+            return error.NoChoices;
+        }
+
+        const first_choice = try Json.asObject(diag, choices.items[0], "response.choices[0]");
+        const message_obj = try Json.asObject(diag, try Json.field(diag, first_choice, "message"), "response.choices[0].message");
+
+        const assistant = parseAssistantMessage(allocator, diag, message_obj) catch |err| return err;
+
+        try messages.append(allocator, .{
+            .role = "assistant",
+            .content = assistant.content,
+            .tool_calls = assistant.tool_calls,
+        });
+
+        if (assistant.tool_calls == null or assistant.tool_calls.?.len == 0) {
+            if (assistant.content) |final_content| {
+                try writeAll(diag, final_content);
+            } else {
+                diag.setBorrowed(.validation, "Assistant final response does not include content");
+                return error.MissingField;
+            }
+            break;
+        }
+
+        for (assistant.tool_calls.?) |call| {
+            const result = try executeToolCall(allocator, diag, call);
+            try messages.append(allocator, .{
+                .role = "tool",
+                .tool_call_id = try allocator.dupe(u8, call.id),
+                .content = result,
+            });
+        }
+    } else {
+        diag.setBorrowed(.validation, "Agent loop exceeded maximum iterations");
+        return error.AgentLoopExceeded;
+    }
 }
 
 pub fn main() !void {
@@ -530,7 +632,6 @@ pub fn main() !void {
             error.MissingField,
             error.InvalidType,
             error.InvalidToolCallsShape,
-            error.EmptyToolCalls,
             error.UnsupportedFunction,
             error.NoChoices,
             error.RequestedFileNotFound,
@@ -539,6 +640,7 @@ pub fn main() !void {
             error.HttpError,
             error.JsonError,
             error.ApiError,
+            error.AgentLoopExceeded,
             => userFacingMessage(allocator, err, &diagnostics) catch "[Internal] Failed to format error message",
             else => "Unexpected runtime error",
         };
