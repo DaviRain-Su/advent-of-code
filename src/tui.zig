@@ -21,6 +21,7 @@ const UiMode = enum {
 };
 
 const FocusPanel = enum {
+    input,
     history,
     logs,
 };
@@ -84,7 +85,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
 
     const theme: Theme = .{};
     var mode: UiMode = .input;
-    var focus: FocusPanel = .history;
+    var focus: FocusPanel = .input;
     var show_empty_warning = false;
 
     var winsize: ?vaxis.Winsize = null;
@@ -128,7 +129,19 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
             },
             .key_press => |key| {
                 if (key.matches(Key.tab, .{})) {
-                    focus = if (focus == .history) .logs else .history;
+                    focus = switch (focus) {
+                        .input => .history,
+                        .history => .logs,
+                        .logs => .input,
+                    };
+                    break;
+                }
+                if (key.matches(Key.tab, .{ .shift = true })) {
+                    focus = switch (focus) {
+                        .input => .logs,
+                        .history => .input,
+                        .logs => .history,
+                    };
                     break;
                 }
 
@@ -138,6 +151,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
 
                 switch (mode) {
                     .input => {
+                        if (focus != .input) break;
                         if (key.matches(Key.enter, .{}) or key.matches(Key.kp_enter, .{})) {
                             if (input.buf.realLength() == 0) {
                                 show_empty_warning = true;
@@ -243,12 +257,19 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
     const title_segment = vaxis.Cell.Segment{ .text = "Claude Code TUI", .style = state.theme.title };
     _ = win.printSegment(title_segment, .{ .row_offset = 0, .col_offset = 0, .wrap = .none });
 
-    const help_text = switch (state.mode) {
-        .input => "Enter prompt and press Enter. Ctrl+C to cancel. Tab switches panel.",
-        .running => "Running...",
-        .done => "Press Enter for a new prompt. Press q to quit. Tab switches panel.",
+    const focus_label = switch (state.focus) {
+        .input => "Input",
+        .history => "History",
+        .logs => "Logs",
     };
-    const help_segment = vaxis.Cell.Segment{ .text = help_text, .style = state.theme.status };
+    const help_text = switch (state.mode) {
+        .input => "Enter prompt and press Enter. Tab switches focus. Focus: ",
+        .running => "Running... Focus: ",
+        .done => "Press Enter for a new prompt. Press q to quit. Focus: ",
+    };
+    var help_buf: [256]u8 = undefined;
+    const help_line = std.fmt.bufPrint(&help_buf, "{s}{s}", .{ help_text, focus_label }) catch help_text;
+    const help_segment = vaxis.Cell.Segment{ .text = help_line, .style = state.theme.status };
     _ = win.printSegment(help_segment, .{ .row_offset = 1, .col_offset = 0, .wrap = .none });
 
     if (state.show_empty_warning and win.height > 2) {
@@ -350,20 +371,26 @@ fn drawPanel(panel: vaxis.Window, view: *TextView, buffer: *TextView.Buffer, tit
 }
 
 fn handleScrollKey(key: Key, focus: FocusPanel, history_view: *TextView, log_view: *TextView) bool {
-    if (key.matches(Key.page_up, .{}) or
+    const is_scroll = key.matches(Key.page_up, .{}) or
         key.matches(Key.page_down, .{}) or
         key.matches(Key.home, .{}) or
         key.matches(Key.end, .{}) or
+        key.matches(Key.up, .{}) or
+        key.matches(Key.down, .{}) or
         key.matches(Key.up, .{ .ctrl = true }) or
-        key.matches(Key.down, .{ .ctrl = true }))
-    {
-        if (focus == .history) {
-            history_view.input(key);
-        } else {
-            log_view.input(key);
-        }
+        key.matches(Key.down, .{ .ctrl = true });
+
+    if (!is_scroll) return false;
+
+    if (focus == .history) {
+        history_view.input(key);
         return true;
     }
+    if (focus == .logs) {
+        log_view.input(key);
+        return true;
+    }
+
     return false;
 }
 
