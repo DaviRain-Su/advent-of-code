@@ -2,7 +2,6 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const builtin = @import("builtin");
 
-const App = @import("app.zig");
 const Errors = @import("errors.zig");
 const ErrorReport = Errors.ErrorReport;
 const Controller = @import("tui_controller.zig");
@@ -105,9 +104,13 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                 const cmd = try controller.handleKeyEvent(allocator, key, diag);
                 switch (cmd) {
                     .exit => return error.UsageError,
-                    .submit_prompt => |prompt| {
-                        defer allocator.free(prompt);
-                        try executePrompt(allocator, diag, &controller, &vx, tty.writer(), prompt);
+                    .submit_prompt => {
+                        render(&vx, tty.writer(), &controller.state) catch |err| {
+                            controller.log("render before runWithPrompt failed: {s}", .{@errorName(err)});
+                            diag.setf(.usage, "TUI render failed: {s}", .{@errorName(err)}) catch {};
+                            return error.TuiUnavailable;
+                        };
+                        try controller.executeCommand(allocator, diag, cmd);
                     },
                     .none => {},
                 }
@@ -119,41 +122,6 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
             diag.setf(.usage, "TUI render failed: {s}", .{@errorName(err)}) catch {};
             return error.TuiUnavailable;
         };
-    }
-}
-
-fn executePrompt(
-    allocator: std.mem.Allocator,
-    diag: *ErrorReport,
-    controller: *Controller.TuiController,
-    vx: *vaxis.Vaxis,
-    writer: *std.Io.Writer,
-    prompt: []const u8,
-) !void {
-    render(vx, writer, &controller.state) catch |err| {
-        controller.log("render before runWithPrompt failed: {s}", .{@errorName(err)});
-        diag.setf(.usage, "TUI render failed: {s}", .{@errorName(err)}) catch {};
-        return error.TuiUnavailable;
-    };
-
-    var run_error: ?[]const u8 = null;
-    controller.log("runWithPrompt start len={d}", .{prompt.len});
-
-    App.runWithPrompt(allocator, diag, prompt, &controller.state.output, controller.logSink()) catch |err| {
-        controller.state.output.clearRetainingCapacity();
-        const msg = try allocator.dupe(u8, Errors.userFacingMessage(allocator, err, diag) catch "Unexpected runtime error");
-        controller.log("runWithPrompt error: {s}", .{@errorName(err)});
-        controller.log("details: {s}", .{msg});
-        try controller.appendMessage(.system, msg);
-        try controller.state.output.appendSlice(allocator, msg);
-        run_error = msg;
-    };
-
-    controller.log("runWithPrompt end len={d}", .{controller.state.output.items.len});
-    try controller.finishRun();
-
-    if (run_error) |msg| {
-        allocator.free(msg);
     }
 }
 

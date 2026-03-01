@@ -1,6 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
+const App = @import("app.zig");
 const Agent = @import("agent.zig");
 const Errors = @import("errors.zig");
 const ErrorReport = Errors.ErrorReport;
@@ -154,13 +155,39 @@ pub const TuiController = struct {
         try appendMessageInternal(self.state.allocator, &self.state.messages, role, content);
     }
 
-    pub fn finishRun(self: *TuiController) !void {
-        if (self.state.output.items.len > 0) {
-            try self.appendMessage(.assistant, self.state.output.items);
-        }
+    pub fn executeCommand(self: *TuiController, allocator: std.mem.Allocator, diag: *ErrorReport, cmd: Command) !void {
+        switch (cmd) {
+            .none => {},
+            .exit => {},
+            .submit_prompt => |prompt| {
+                defer allocator.free(prompt);
 
-        try self.appendMessage(.system, "Done.");
-        self.state.mode = .input;
+                var run_error: ?[]const u8 = null;
+                self.log("runWithPrompt start len={d}", .{prompt.len});
+
+                App.runWithPrompt(allocator, diag, prompt, &self.state.output, self.logSink()) catch |err| {
+                    self.state.output.clearRetainingCapacity();
+                    const msg = try allocator.dupe(u8, Errors.userFacingMessage(allocator, err, diag) catch "Unexpected runtime error");
+                    self.log("runWithPrompt error: {s}", .{@errorName(err)});
+                    self.log("details: {s}", .{msg});
+                    try self.appendMessage(.system, msg);
+                    try self.state.output.appendSlice(allocator, msg);
+                    run_error = msg;
+                };
+
+                self.log("runWithPrompt end len={d}", .{self.state.output.items.len});
+                if (self.state.output.items.len > 0) {
+                    try self.appendMessage(.assistant, self.state.output.items);
+                }
+
+                try self.appendMessage(.system, "Done.");
+                self.state.mode = .input;
+
+                if (run_error) |msg| {
+                    allocator.free(msg);
+                }
+            },
+        }
     }
 
     fn submitPrompt(self: *TuiController, allocator: std.mem.Allocator) !Command {
