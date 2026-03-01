@@ -59,6 +59,13 @@ const LogState = struct {
     theme: Theme,
 };
 
+fn logCrash(file: *std.fs.File, comptime fmt: []const u8, args: anytype) void {
+    var buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    _ = file.write(line) catch {};
+    _ = file.write("\n") catch {};
+}
+
 pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
     if (!std.posix.isatty(std.posix.STDIN_FILENO)) {
         diag.setBorrowed(.usage, "TUI requires a TTY. Use -p for CLI mode.");
@@ -74,6 +81,12 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
 
     const crash_log = std.fs.cwd().createFile("/tmp/claude_tui_crash.log", .{ .truncate = true }) catch null;
     defer if (crash_log) |file| file.close();
+    errdefer |err| {
+        if (crash_log) |file| {
+            var mutable = file;
+            logCrash(&mutable, "tui error: {s}", .{@errorName(err)});
+        }
+    }
 
     var vx = try vaxis.init(allocator, .{});
     defer vx.deinit(allocator, tty.writer());
@@ -138,9 +151,6 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                 vx.queueRefresh();
             },
             .key_press => |key| {
-                if (crash_log) |*file| {
-                    _ = file.write("key\n") catch {};
-                }
                 if (mode == .running) {
                     if (key.matches('c', .{ .ctrl = true })) {
                         diag.setBorrowed(.usage, "Prompt cancelled");
@@ -198,21 +208,37 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
 
                     try appendMessage(allocator, &messages, .user, prompt);
                     try appendMessage(allocator, &messages, .system, "Running prompt...");
-                    try render(&vx, tty.writer(), &messages, &input_buffer, mode, theme);
+                    render(&vx, tty.writer(), &messages, &input_buffer, mode, theme) catch |err| {
+                        if (crash_log) |file| {
+                            var mutable = file;
+                            logCrash(&mutable, "render before runWithPrompt failed: {s}", .{@errorName(err)});
+                        }
+                        diag.setf(.usage, "TUI render failed: {s}", .{@errorName(err)}) catch {};
+                        return error.TuiUnavailable;
+                    };
+
+                    if (crash_log) |file| {
+                        var mutable = file;
+                        logCrash(&mutable, "runWithPrompt start len={d}", .{prompt.len});
+                    }
 
                     App.runWithPrompt(allocator, diag, prompt, &output, sink) catch |err| {
                         output.clearRetainingCapacity();
                         const msg = Errors.userFacingMessage(allocator, err, diag) catch "Unexpected runtime error";
                         defer allocator.free(msg);
-                        if (crash_log) |*file| {
-                            _ = file.write("runWithPrompt error\n") catch {};
-                            _ = file.write("details:\n") catch {};
-                            _ = file.write(msg) catch {};
-                            _ = file.write("\n") catch {};
+                        if (crash_log) |file| {
+                            var mutable = file;
+                            logCrash(&mutable, "runWithPrompt error: {s}", .{@errorName(err)});
+                            logCrash(&mutable, "details: {s}", .{msg});
                         }
                         try appendMessage(allocator, &messages, .system, msg);
                         try output.appendSlice(allocator, msg);
                     };
+
+                    if (crash_log) |file| {
+                        var mutable = file;
+                        logCrash(&mutable, "runWithPrompt end len={d}", .{output.items.len});
+                    }
 
                     if (output.items.len > 0) {
                         try appendMessage(allocator, &messages, .assistant, output.items);
@@ -234,7 +260,14 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
             },
         }
 
-        try render(&vx, tty.writer(), &messages, &input_buffer, mode, theme);
+        render(&vx, tty.writer(), &messages, &input_buffer, mode, theme) catch |err| {
+            if (crash_log) |file| {
+                var mutable = file;
+                logCrash(&mutable, "render loop failed: {s}", .{@errorName(err)});
+            }
+            diag.setf(.usage, "TUI render failed: {s}", .{@errorName(err)}) catch {};
+            return error.TuiUnavailable;
+        };
     }
 }
 
