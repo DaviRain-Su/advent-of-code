@@ -42,6 +42,7 @@ const Theme = struct {
 const LogState = struct {
     allocator: std.mem.Allocator,
     buffer: *TextView.Buffer,
+    view: *TextView,
     theme: Theme,
 };
 
@@ -94,7 +95,6 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
     const theme: Theme = .{};
     var mode: UiMode = .input;
     var focus: FocusPanel = .input;
-    var show_empty_warning = false;
 
     var winsize: ?vaxis.Winsize = null;
     while (winsize == null) {
@@ -120,12 +120,10 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
         .log_buffer = &log_buffer,
         .mode = mode,
         .focus = focus,
-        .show_empty_warning = show_empty_warning,
         .theme = theme,
-        .prompt_count = input_history.items.len,
     });
 
-    var log_state = LogState{ .allocator = allocator, .buffer = &log_buffer, .theme = theme };
+    var log_state = LogState{ .allocator = allocator, .buffer = &log_buffer, .view = &log_view, .theme = theme };
     const sink = Agent.LogSink{ .ctx = &log_state, .write = logSinkWrite };
 
     while (true) {
@@ -183,9 +181,9 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                             }
                         } else if (key.matches(Key.enter, .{}) or key.matches(Key.kp_enter, .{})) {
                             if (input.buf.realLength() == 0) {
-                                show_empty_warning = true;
+                                try appendStyled(allocator, &log_buffer, theme.warning, "Prompt cannot be empty.\n");
+                                scrollToBottom(&log_view, &log_buffer);
                             } else {
-                                show_empty_warning = false;
                                 const prompt = input.buf.toOwnedSlice() catch |err| {
                                     diag.setf(.validation, "Failed to capture prompt: {any}", .{err}) catch {};
                                     return error.UsageError;
@@ -202,7 +200,9 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                                 try appendStyled(allocator, &history_buffer, theme.user, "User: ");
                                 try appendPlain(allocator, &history_buffer, prompt);
                                 try appendPlain(allocator, &history_buffer, "\n");
+                                scrollToBottom(&history_view, &history_buffer);
                                 try appendPlain(allocator, &log_buffer, "Running prompt...\n");
+                                scrollToBottom(&log_view, &log_buffer);
 
                                 try render(&vx, tty.writer(), .{
                                     .input = &input,
@@ -212,9 +212,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                                     .log_buffer = &log_buffer,
                                     .mode = mode,
                                     .focus = focus,
-                                    .show_empty_warning = show_empty_warning,
                                     .theme = theme,
-                                    .prompt_count = input_history.items.len,
                                 });
 
                                 App.runWithPrompt(allocator, diag, prompt, &output, sink) catch |err| {
@@ -225,15 +223,18 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                                     try appendPlain(allocator, &log_buffer, msg);
                                     try appendPlain(allocator, &log_buffer, "\n");
                                     try output.appendSlice(allocator, msg);
+                                    scrollToBottom(&log_view, &log_buffer);
                                 };
 
                                 if (output.items.len > 0) {
                                     try appendStyled(allocator, &history_buffer, theme.assistant, "Assistant: ");
                                     try appendPlain(allocator, &history_buffer, output.items);
                                     try appendPlain(allocator, &history_buffer, "\n");
+                                    scrollToBottom(&history_view, &history_buffer);
                                 }
 
                                 try appendPlain(allocator, &log_buffer, "Done.\n");
+                                scrollToBottom(&log_view, &log_buffer);
                                 mode = .done;
                             }
                         } else if (key.matches('c', .{ .ctrl = true })) {
@@ -241,14 +242,12 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                             return error.UsageError;
                         } else {
                             try input.update(.{ .key_press = key });
-                            show_empty_warning = false;
                         }
                     },
                     .running => {},
                     .done => {
                         if (key.matches(Key.enter, .{}) or key.matches(Key.kp_enter, .{})) {
                             mode = .input;
-                            show_empty_warning = false;
                         } else if (key.matches('q', .{}) or key.matches('c', .{ .ctrl = true })) {
                             return;
                         }
@@ -265,9 +264,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
             .log_buffer = &log_buffer,
             .mode = mode,
             .focus = focus,
-            .show_empty_warning = show_empty_warning,
             .theme = theme,
-            .prompt_count = input_history.items.len,
         });
     }
 }
@@ -280,61 +277,23 @@ const RenderState = struct {
     log_buffer: *TextView.Buffer,
     mode: UiMode,
     focus: FocusPanel,
-    show_empty_warning: bool,
     theme: Theme,
-    prompt_count: usize,
 };
 
 fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !void {
     const win = vx.window();
     win.fill(.{ .style = state.theme.bg });
 
-    const title_segment = vaxis.Cell.Segment{ .text = "Claude Code TUI", .style = state.theme.title };
-    _ = win.printSegment(title_segment, .{ .row_offset = 0, .col_offset = 0, .wrap = .none });
-
-    const focus_label = switch (state.focus) {
-        .input => "Input",
-        .history => "History",
-        .logs => "Logs",
-    };
-    const help_text = switch (state.mode) {
-        .input => "Enter prompt and press Enter. Tab switches focus. Focus: ",
-        .running => "Running... Focus: ",
-        .done => "Press Enter for a new prompt. Press q to quit. Focus: ",
-    };
-    var help_buf: [256]u8 = undefined;
-    const help_line = std.fmt.bufPrint(&help_buf, "{s}{s}", .{ help_text, focus_label }) catch help_text;
-    const help_segment = vaxis.Cell.Segment{ .text = help_line, .style = state.theme.status };
-    _ = win.printSegment(help_segment, .{ .row_offset = 1, .col_offset = 0, .wrap = .none });
-
-    if (win.height > 2) {
-        var status_buf: [128]u8 = undefined;
-        const status_line = std.fmt.bufPrint(
-            &status_buf,
-            "Prompts: {d}  History rows: {d}  Log rows: {d}",
-            .{ state.prompt_count, state.history_buffer.rows, state.log_buffer.rows },
-        ) catch "";
-        const status_segment = vaxis.Cell.Segment{ .text = status_line, .style = state.theme.status };
-        _ = win.printSegment(status_segment, .{ .row_offset = 2, .col_offset = 0, .wrap = .none });
-    }
-
-    if (state.show_empty_warning and win.height > 3) {
-        const warning = vaxis.Cell.Segment{ .text = "Prompt cannot be empty.", .style = state.theme.warning };
-        _ = win.printSegment(warning, .{ .row_offset = 3, .col_offset = 0, .wrap = .none });
-    }
-
     const total_height: usize = win.height;
     const total_width: usize = win.width;
-    if (total_height < 6 or total_width < 10) {
+    if (total_height < 2 or total_width < 10) {
         try vx.render(tty_writer);
         return;
     }
 
-    const content_start: usize = 4;
-    const content_height: usize = total_height - 6;
-    const history_height: usize = content_height * 2 / 3;
-    _ = history_height;
-    const split_col: usize = total_width * 2 / 3;
+    const content_start: usize = 0;
+    const content_height: usize = total_height - 1;
+    const split_col: usize = total_width * 3 / 4;
 
     const history_panel = win.child(.{
         .x_off = 0,
@@ -456,6 +415,10 @@ fn appendStyled(allocator: std.mem.Allocator, buffer: *TextView.Buffer, style: v
     try buffer.updateStyle(allocator, .{ .begin = start, .end = end, .style = style });
 }
 
+fn scrollToBottom(view: *TextView, buffer: *TextView.Buffer) void {
+    view.scroll_view.scroll.y = buffer.rows;
+}
+
 fn setInputText(input: *TextInput, text: []const u8) !void {
     input.buf.clearRetainingCapacity();
     if (text.len == 0) return;
@@ -478,4 +441,5 @@ fn logSinkWrite(ctx: *anyopaque, msg: []const u8) void {
         appendStyled(state.allocator, state.buffer, style, line) catch {};
         appendPlain(state.allocator, state.buffer, "\n") catch {};
     }
+    scrollToBottom(state.view, state.buffer);
 }
