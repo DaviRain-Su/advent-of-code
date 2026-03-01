@@ -73,30 +73,24 @@ pub const TuiState = struct {
     }
 };
 
-pub const KeyAction = enum {
+pub const Command = union(enum) {
     none,
-    submit,
+    submit_prompt: []const u8,
     exit,
 };
 
 pub const TuiController = struct {
     state: TuiState,
-    pending_prompt: ?[]const u8,
     crash_log: ?std.fs.File,
 
     pub fn init(allocator: std.mem.Allocator, theme: Theme) TuiController {
         return .{
             .state = TuiState.init(allocator, theme),
-            .pending_prompt = null,
             .crash_log = null,
         };
     }
 
     pub fn deinit(self: *TuiController) void {
-        if (self.pending_prompt) |prompt| {
-            self.state.allocator.free(prompt);
-        }
-
         self.state.deinit();
 
         if (self.crash_log) |file| {
@@ -125,13 +119,13 @@ pub const TuiController = struct {
         allocator: std.mem.Allocator,
         key: Key,
         diag: *ErrorReport,
-    ) !KeyAction {
+    ) !Command {
         if (self.state.mode == .running) {
             if (key.matches('c', .{ .ctrl = true })) {
                 diag.setBorrowed(.usage, "Prompt cancelled");
                 return .exit;
             }
-            return .none;
+            return Command.none;
         }
 
         if (key.matches(Key.up, .{})) {
@@ -149,13 +143,7 @@ pub const TuiController = struct {
             try self.state.input_buffer.appendSlice(allocator, text);
         }
 
-        return .none;
-    }
-
-    pub fn consumePendingPrompt(self: *TuiController) ?[]const u8 {
-        const prompt = self.pending_prompt;
-        self.pending_prompt = null;
-        return prompt;
+        return Command.none;
     }
 
     pub fn logSink(self: *TuiController) Agent.LogSink {
@@ -175,7 +163,7 @@ pub const TuiController = struct {
         self.state.mode = .input;
     }
 
-    fn submitPrompt(self: *TuiController, allocator: std.mem.Allocator) !KeyAction {
+    fn submitPrompt(self: *TuiController, allocator: std.mem.Allocator) !Command {
         if (self.state.input_buffer.items.len == 0) {
             try self.appendMessage(.system, "Prompt cannot be empty.");
             return .none;
@@ -192,8 +180,7 @@ pub const TuiController = struct {
         self.state.input_buffer.clearRetainingCapacity();
         self.state.history_index = null;
         self.state.mode = .running;
-        self.pending_prompt = prompt;
-        return .submit;
+        return .{ .submit_prompt = prompt };
     }
 
     fn navigateHistoryUp(self: *TuiController, allocator: std.mem.Allocator) !void {

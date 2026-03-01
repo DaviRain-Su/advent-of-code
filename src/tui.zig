@@ -102,12 +102,10 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                 vx.queueRefresh();
             },
             .key_press => |key| {
-                const action = try controller.handleKeyEvent(allocator, key, diag);
-                switch (action) {
-                    .exit => {
-                        return error.UsageError;
-                    },
-                    .submit => if (controller.consumePendingPrompt()) |prompt| {
+                const cmd = try controller.handleKeyEvent(allocator, key, diag);
+                switch (cmd) {
+                    .exit => return error.UsageError,
+                    .submit_prompt => |prompt| {
                         defer allocator.free(prompt);
                         try executePrompt(allocator, diag, &controller, &vx, tty.writer(), prompt);
                     },
