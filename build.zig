@@ -2,13 +2,24 @@ const std = @import("std");
 
 // Learn more about this file here: https://ziglang.org/learn/build-system
 pub fn build(b: *std.Build) void {
+    const target = b.graph.host;
+    const optimize = b.standardOptimizeOption(.{});
+
+    const vaxis_dep = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "main",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
-            .target = b.graph.host,
+            .target = target,
+            .optimize = optimize,
         }),
     });
+
+    exe.root_module.addImport("vaxis", vaxis_dep.module("vaxis"));
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
