@@ -4,6 +4,21 @@ const Config = struct {
     api_key: []const u8,
     base_url: []const u8,
     model: []const u8,
+
+    fn fromEnv() Config {
+        const api_key = std.posix.getenv("OPENROUTER_API_KEY") orelse @panic("OPENROUTER_API_KEY is not set");
+        const base_url = std.posix.getenv("OPENROUTER_BASE_URL") orelse Defaults.default_base_url;
+        const default_model = if (std.mem.indexOf(u8, base_url, "deepseek") != null)
+            Defaults.default_deepseek_model
+        else
+            Defaults.default_openai_model;
+
+        return .{
+            .api_key = api_key,
+            .base_url = base_url,
+            .model = std.posix.getenv("OPENROUTER_MODEL") orelse default_model,
+        };
+    }
 };
 
 const Defaults = struct {
@@ -22,6 +37,27 @@ const AssistantAction = union(enum) {
     none,
 };
 
+const Json = struct {
+    fn field(obj: std.json.ObjectMap, key: []const u8) std.json.Value {
+        return obj.get(key) orelse @panic("Expected field in response JSON");
+    }
+
+    fn asString(value: std.json.Value) []const u8 {
+        if (value != .string) @panic("Expected string in response JSON");
+        return value.string;
+    }
+
+    fn asArray(value: std.json.Value) std.json.Array {
+        if (value != .array) @panic("Expected array in response JSON");
+        return value.array;
+    }
+
+    fn asObject(value: std.json.Value) std.json.ObjectMap {
+        if (value != .object) @panic("Expected object in response JSON");
+        return value.object;
+    }
+};
+
 fn parsePrompt(allocator: std.mem.Allocator) ![]const u8 {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -31,40 +67,6 @@ fn parsePrompt(allocator: std.mem.Allocator) ![]const u8 {
     }
 
     return try allocator.dupe(u8, args[2]);
-}
-
-fn loadConfig() Config {
-    const api_key = std.posix.getenv("OPENROUTER_API_KEY") orelse @panic("OPENROUTER_API_KEY is not set");
-    const base_url = std.posix.getenv("OPENROUTER_BASE_URL") orelse Defaults.default_base_url;
-    const default_model = if (std.mem.indexOf(u8, base_url, "deepseek") != null)
-        Defaults.default_deepseek_model
-    else
-        Defaults.default_openai_model;
-
-    return .{
-        .api_key = api_key,
-        .base_url = base_url,
-        .model = std.posix.getenv("OPENROUTER_MODEL") orelse default_model,
-    };
-}
-
-fn getField(obj: std.json.ObjectMap, key: []const u8) std.json.Value {
-    return obj.get(key) orelse @panic("Expected field in response JSON");
-}
-
-fn asString(v: std.json.Value) []const u8 {
-    if (v != .string) @panic("Expected string in response JSON");
-    return v.string;
-}
-
-fn asArray(v: std.json.Value) std.json.Array {
-    if (v != .array) @panic("Expected array in response JSON");
-    return v.array;
-}
-
-fn asObject(v: std.json.Value) std.json.ObjectMap {
-    if (v != .object) @panic("Expected object in response JSON");
-    return v.object;
 }
 
 fn writeAllOrPanic(data: []const u8) void {
@@ -78,14 +80,15 @@ fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn readRequestedFile(allocator: std.mem.Allocator, requested_path: []const u8) ![]u8 {
-    // First try the path as provided by the model.
+    // First try exactly the path returned by the model.
     if (readFileAll(allocator, requested_path)) |contents| {
         return contents;
     } else |err| {
         if (err != error.FileNotFound) return err;
     }
 
-    // Keep backward-compatibility behavior for bare filenames (e.g. "main.zig").
+    // Keep the current compatibility behavior: bare filenames (no path separators)
+    // can fall back to src/<filename>.
     const looksLikeBareName =
         std.mem.indexOfScalar(u8, requested_path, '/') == null and
         std.mem.indexOfScalar(u8, requested_path, '\\') == null;
@@ -161,7 +164,7 @@ fn sendCompletionRequest(allocator: std.mem.Allocator, cfg: Config, prompt: []co
     return try allocator.dupe(u8, response_out.written());
 }
 
-fn throwOnApiError(response_obj: std.json.ObjectMap) void {
+fn checkApiError(response_obj: std.json.ObjectMap) void {
     if (response_obj.get("error")) |error_obj| {
         if (error_obj == .string) {
             @panic(error_obj.string);
@@ -177,27 +180,27 @@ fn throwOnApiError(response_obj: std.json.ObjectMap) void {
     }
 }
 
-fn parseReadToolPath(tool_calls: std.json.Value, allocator: std.mem.Allocator) ![]const u8 {
-    const tool_call_list = asArray(tool_calls);
-
+fn parseReadToolPath(allocator: std.mem.Allocator, tool_calls: std.json.Value) ![]const u8 {
+    const tool_call_list = Json.asArray(tool_calls);
     if (tool_call_list.items.len == 0) {
         @panic("Empty tool_calls array");
     }
 
-    const first_tool = asObject(tool_call_list.items[0]);
-    const function_obj = asObject(getField(first_tool, "function"));
-    const function_name = asString(getField(function_obj, "name"));
+    const first_tool_call = Json.asObject(tool_call_list.items[0]);
+    const function_obj = Json.asObject(Json.field(first_tool_call, "function"));
+    const function_name = Json.asString(Json.field(function_obj, "name"));
 
     if (!std.mem.eql(u8, function_name, Defaults.read_tool_name)) {
         @panic("Unsupported function");
     }
 
-    const args_raw = asString(getField(function_obj, "arguments"));
+    const args_raw = Json.asString(Json.field(function_obj, "arguments"));
     var parsed_args = try std.json.parseFromSlice(std.json.Value, allocator, args_raw, .{});
     defer parsed_args.deinit();
 
-    const args_obj = asObject(parsed_args.value);
-    return asString(getField(args_obj, Defaults.read_file_param));
+    const args_obj = Json.asObject(parsed_args.value);
+    const file_path = Json.asString(Json.field(args_obj, Defaults.read_file_param));
+    return try allocator.dupe(u8, file_path);
 }
 
 fn parseAssistantAction(allocator: std.mem.Allocator, message: std.json.ObjectMap) !AssistantAction {
@@ -205,16 +208,23 @@ fn parseAssistantAction(allocator: std.mem.Allocator, message: std.json.ObjectMa
         if (tool_calls == .null) return .none;
         if (tool_calls != .array) @panic("tool_calls is not an array");
 
-        const file_path = try parseReadToolPath(tool_calls, allocator);
+        const file_path = try parseReadToolPath(allocator, tool_calls);
         return .{ .read_file = file_path };
     }
 
-    const content = getField(message, "content");
+    const content = Json.field(message, "content");
     if (content == .string) {
         return .{ .reply_text = content.string };
     }
 
     return .none;
+}
+
+fn freeAssistantAction(allocator: std.mem.Allocator, action: AssistantAction) void {
+    switch (action) {
+        .read_file => |path| allocator.free(path),
+        else => {},
+    }
 }
 
 fn executeAssistantAction(allocator: std.mem.Allocator, action: AssistantAction) !void {
@@ -223,7 +233,9 @@ fn executeAssistantAction(allocator: std.mem.Allocator, action: AssistantAction)
         .reply_text => |text| writeAllOrPanic(text),
         .read_file => |path| {
             const file_contents = readRequestedFile(allocator, path) catch |err| {
-                if (err == error.FileNotFound) @panic("Failed to read requested file path");
+                if (err == error.FileNotFound) {
+                    @panic("Failed to read requested file path");
+                }
                 return err;
             };
             defer allocator.free(file_contents);
@@ -240,22 +252,24 @@ pub fn main() !void {
     const prompt = try parsePrompt(allocator);
     defer allocator.free(prompt);
 
-    const config = loadConfig();
+    const config = Config.fromEnv();
     const response_body = try sendCompletionRequest(allocator, config, prompt);
     defer allocator.free(response_body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_body, .{});
     defer parsed.deinit();
 
-    const response_obj = asObject(parsed.value);
-    throwOnApiError(response_obj);
+    const response_obj = Json.asObject(parsed.value);
+    checkApiError(response_obj);
 
-    const choices = asArray(getField(response_obj, "choices"));
+    const choices = Json.asArray(Json.field(response_obj, "choices"));
     if (choices.items.len == 0) @panic("No choices in response");
 
-    const first_choice = asObject(choices.items[0]);
-    const message = asObject(getField(first_choice, "message"));
+    const first_choice = Json.asObject(choices.items[0]);
+    const message = Json.asObject(Json.field(first_choice, "message"));
 
     const action = try parseAssistantAction(allocator, message);
+    defer freeAssistantAction(allocator, action);
+
     try executeAssistantAction(allocator, action);
 }
