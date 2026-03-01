@@ -2,7 +2,6 @@ const std = @import("std");
 
 const Errors = @import("errors.zig");
 const ErrorReport = Errors.ErrorReport;
-const AppError = Errors.AppError;
 const App = @import("app.zig");
 
 pub fn main() !void {

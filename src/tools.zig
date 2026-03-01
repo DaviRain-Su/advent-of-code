@@ -17,7 +17,7 @@ pub fn freeToolCallList(allocator: std.mem.Allocator, calls: []const Models.Tool
     }
 }
 
-pub fn freeConversationMessage(allocator: std.mem.Allocator, message: *Models.Message) void {
+pub fn freeConversationMessage(allocator: std.mem.Allocator, message: *const Models.Message) void {
     if (message.content) |content| {
         allocator.free(content);
     }

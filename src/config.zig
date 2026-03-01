@@ -37,3 +37,11 @@ pub fn loadConfig(diag: *ErrorReport) !Config {
         .model = std.posix.getenv("OPENROUTER_MODEL") orelse default_model,
     };
 }
+
+/// Maximum number of assistant/tool loop iterations.
+/// Can be overridden with CLAUDE_AGENT_MAX_ITERATIONS.
+pub fn maxAgentIterations() u8 {
+    const raw = std.posix.getenv("CLAUDE_AGENT_MAX_ITERATIONS") orelse return Defaults.max_agent_iterations;
+    const parsed = std.fmt.parseInt(u8, raw, 10) catch return Defaults.max_agent_iterations;
+    return if (parsed == 0) Defaults.max_agent_iterations else parsed;
+}
