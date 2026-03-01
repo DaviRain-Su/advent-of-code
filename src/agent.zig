@@ -21,6 +21,8 @@ pub const LogSink = struct {
     write: *const fn (ctx: *anyopaque, msg: []const u8) void,
 };
 
+pub const StreamSink = Llm.StreamSink;
+
 fn logSink(sink: ?LogSink, comptime fmt: []const u8, args: anytype) void {
     if (sink) |s| {
         var scratch: [512]u8 = undefined;
@@ -44,7 +46,15 @@ fn logSinkSnippet(sink: ?LogSink, label: []const u8, content: []const u8) void {
     sink.?.write(sink.?.ctx, msg);
 }
 
-pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: ConfigMod.Config, prompt: []const u8, output: ?*std.ArrayList(u8), log_sink: ?LogSink) !void {
+pub fn runAgent(
+    allocator: std.mem.Allocator,
+    diag: *ErrorReport,
+    config: ConfigMod.Config,
+    prompt: []const u8,
+    output: ?*std.ArrayList(u8),
+    log_sink: ?LogSink,
+    stream_sink: ?StreamSink,
+) !void {
     const debug_enabled = ConfigMod.isDebugEnabled();
     const max_tool_calls = ConfigMod.maxToolCallsPerIteration();
     const max_iterations = ConfigMod.maxAgentIterations();
@@ -70,17 +80,44 @@ pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: Config
     while (iterations < max_iterations) : (iterations += 1) {
         try debugf(debug_enabled, "iteration {d}: sending completion request with {d} messages", .{ iterations, messages.items.len });
 
-        const response_body = Llm.sendCompletionRequest(allocator, diag, config, messages.items) catch |err| {
-            switch (err) {
-                error.HttpError => {
-                    try diag.setf(.network, "Request failed at iteration {d}: HTTP request failed", .{iterations});
-                    return error.HttpError;
-                },
-                else => {
-                    diag.setf(.network, "Unexpected network error at iteration {d}: {any}", .{ iterations, err }) catch {};
-                    return error.HttpError;
-                },
+        var request_used_streaming = false;
+        const response_body = blk: {
+            if (stream_sink) |sink| {
+                request_used_streaming = true;
+                const streaming = Llm.sendCompletionRequestStreaming(allocator, diag, config, messages.items, sink) catch |err| {
+                    request_used_streaming = false;
+                    switch (err) {
+                        error.StreamingToolCallsUnsupported,
+                        error.HttpError,
+                        error.JsonError,
+                        error.ApiError,
+                        => {
+                            logSink(log_sink, "[agent] streaming request failed ({s}), retrying without stream\n", .{@errorName(err)});
+                            break :blk try Llm.sendCompletionRequest(
+                                allocator,
+                                diag,
+                                config,
+                                messages.items,
+                            );
+                        },
+                        error.OutOfMemory => {
+                            return error.OutOfMemory;
+                        },
+                        else => {
+                            logSink(log_sink, "[agent] streaming request failed ({s}), retrying without stream\n", .{@errorName(err)});
+                            break :blk try Llm.sendCompletionRequest(
+                                allocator,
+                                diag,
+                                config,
+                                messages.items,
+                            );
+                        },
+                    }
+                };
+                break :blk streaming;
             }
+
+            break :blk try Llm.sendCompletionRequest(allocator, diag, config, messages.items);
         };
         defer allocator.free(response_body);
 
@@ -132,6 +169,7 @@ pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: Config
             .content = assistant.content,
             .tool_calls = assistant.tool_calls,
             .tool_call_id = null,
+            .reasoning_content = assistant.reasoning_content,
         };
 
         messages.append(allocator, assistant_msg) catch |err| {
@@ -145,7 +183,13 @@ pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: Config
                 return error.MissingField;
             };
             if (output) |buffer| {
-                try buffer.appendSlice(allocator, final_content);
+                if (request_used_streaming) {
+                    if (buffer.items.len == 0) {
+                        try buffer.appendSlice(allocator, final_content);
+                    }
+                } else {
+                    try buffer.appendSlice(allocator, final_content);
+                }
             } else {
                 try Prompt.writeAll(diag, final_content);
             }

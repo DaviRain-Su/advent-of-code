@@ -30,6 +30,10 @@ pub fn freeConversationMessage(allocator: std.mem.Allocator, message: *const Mod
     if (message.tool_calls) |tool_calls| {
         freeToolCallList(allocator, tool_calls);
     }
+
+    if (message.reasoning_content) |reasoning_content| {
+        allocator.free(reasoning_content);
+    }
 }
 
 fn isUnsafeToolPath(path: []const u8) bool {
@@ -308,12 +312,24 @@ fn writeRequestedFile(allocator: std.mem.Allocator, diag: *ErrorReport, requeste
 
 pub fn parseAssistantMessage(allocator: std.mem.Allocator, diag: *ErrorReport, message_obj: std.json.ObjectMap) !Models.ParsedAssistantMessage {
     var content: ?[]const u8 = null;
+    var reasoning_content: ?[]const u8 = null;
     if (message_obj.get("content")) |content_raw| {
         switch (content_raw) {
             .string => content = try allocator.dupe(u8, content_raw.string),
             .null => content = null,
             else => {
                 try diag.setf(.json, "Expected assistant content to be a string or null, got {any}", .{content_raw});
+                return error.InvalidType;
+            },
+        }
+    }
+
+    if (message_obj.get("reasoning_content")) |reasoning_raw| {
+        switch (reasoning_raw) {
+            .string => reasoning_content = try allocator.dupe(u8, reasoning_raw.string),
+            .null => reasoning_content = null,
+            else => {
+                try diag.setf(.json, "Expected assistant reasoning_content to be a string or null, got {any}", .{reasoning_raw});
                 return error.InvalidType;
             },
         }
@@ -380,7 +396,11 @@ pub fn parseAssistantMessage(allocator: std.mem.Allocator, diag: *ErrorReport, m
         }
     }
 
-    return .{ .content = content, .tool_calls = tool_calls_out };
+    return .{
+        .content = content,
+        .tool_calls = tool_calls_out,
+        .reasoning_content = reasoning_content,
+    };
 }
 
 pub fn executeToolCall(allocator: std.mem.Allocator, diag: *ErrorReport, call_index: usize, tool_call: Models.ToolCall) ![]u8 {

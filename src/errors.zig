@@ -106,7 +106,7 @@ pub fn userFacingMessage(allocator: std.mem.Allocator, err: anyerror, report: *E
     const category = formatErrorCategory(report.kind);
     const base = switch (err) {
         error.UsageError => "Usage error",
-        error.MissingApiKey => "OpenRouter API key is required",
+        error.MissingApiKey => "Provider API key is required",
         error.MissingField => "Malformed provider response (missing expected JSON field)",
         error.InvalidType => "Malformed provider response (unexpected JSON type)",
         error.InvalidToolCallsShape => "Malformed tool-calls payload shape",

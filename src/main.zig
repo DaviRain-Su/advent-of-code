@@ -4,7 +4,7 @@ const Errors = @import("errors.zig");
 const ErrorReport = Errors.ErrorReport;
 const App = @import("app.zig");
 const Prompt = @import("prompt.zig");
-const Tui = @import("tui.zig");
+const Tui = @import("tui/tui.zig");
 
 // Capture panic traces to a file so TUI crashes can be diagnosed even when
 // terminal output is disrupted.
@@ -40,7 +40,7 @@ pub fn main() !void {
 
     if (prompt_opt) |prompt| {
         defer allocator.free(prompt);
-        App.runWithPrompt(allocator, &diagnostics, prompt, null, null) catch |err| {
+        App.runWithPrompt(allocator, &diagnostics, prompt, null, null, null) catch |err| {
             reportError(allocator, &diagnostics, err);
         };
     } else {

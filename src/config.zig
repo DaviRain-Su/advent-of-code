@@ -9,6 +9,7 @@ pub const Config = struct {
 
 pub const Defaults = struct {
     pub const default_base_url = "https://openrouter.ai/api/v1";
+    pub const default_deepseek_base_url = "https://api.deepseek.com";
     pub const default_openai_model = "anthropic/claude-haiku-4.5";
     pub const default_deepseek_model = "deepseek-chat";
 
@@ -32,6 +33,11 @@ pub const Defaults = struct {
     pub const max_tool_calls_per_iteration: usize = 8;
     pub const default_tool_allowed_dirs: []const []const u8 = &[_][]const u8{ "src", "app" };
 };
+
+fn trimmedEnvValue(name: []const u8) ?[]const u8 {
+    const raw = std.posix.getenv(name) orelse return null;
+    return std.mem.trim(u8, raw, " \t\r\n");
+}
 
 pub fn maxToolReadBytes() usize {
     const raw = std.posix.getenv("CLAUDE_TOOL_MAX_BYTES") orelse return Defaults.max_tool_read_bytes;
@@ -129,21 +135,31 @@ pub fn isDebugEnabled() bool {
 }
 
 pub fn loadConfig(diag: *ErrorReport) !Config {
-    const api_key = std.posix.getenv("OPENROUTER_API_KEY") orelse {
-        diag.setBorrowed(.config, "Missing environment variable OPENROUTER_API_KEY");
+    const deepseek_api_key = trimmedEnvValue("DEEPSEEK_API_KEY");
+    const api_key = trimmedEnvValue("DEEPSEEK_API_KEY") orelse
+        trimmedEnvValue("OPENROUTER_API_KEY") orelse
+        trimmedEnvValue("OPENAI_API_KEY") orelse
+    {
+        diag.setBorrowed(.config, "Missing environment variable DEEPSEEK_API_KEY, OPENROUTER_API_KEY or OPENAI_API_KEY");
         return error.MissingApiKey;
     };
 
-    const base_url = std.posix.getenv("OPENROUTER_BASE_URL") orelse Defaults.default_base_url;
+    const base_url = trimmedEnvValue("DEEPSEEK_BASE_URL") orelse
+        trimmedEnvValue("OPENROUTER_BASE_URL") orelse
+        trimmedEnvValue("OPENAI_BASE_URL") orelse
+        if (deepseek_api_key != null) Defaults.default_deepseek_base_url else Defaults.default_base_url;
     const default_model = if (std.mem.indexOf(u8, base_url, "deepseek") != null)
         Defaults.default_deepseek_model
-    else
+        else
         Defaults.default_openai_model;
 
     return .{
         .api_key = api_key,
         .base_url = base_url,
-        .model = std.posix.getenv("OPENROUTER_MODEL") orelse default_model,
+        .model = trimmedEnvValue("DEEPSEEK_MODEL") orelse
+            trimmedEnvValue("OPENROUTER_MODEL") orelse
+            trimmedEnvValue("OPENAI_MODEL") orelse
+            default_model,
     };
 }
 

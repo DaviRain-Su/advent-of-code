@@ -10,12 +10,13 @@ pub fn runWithPrompt(
     prompt: []const u8,
     output: ?*std.ArrayList(u8),
     log_sink: ?Agent.LogSink,
+    stream_sink: ?Agent.StreamSink,
 ) !void {
     const config = ConfigMod.loadConfig(diag) catch |err| {
         return err;
     };
 
-    try Agent.runAgent(allocator, diag, config, prompt, output, log_sink);
+    try Agent.runAgent(allocator, diag, config, prompt, output, log_sink, stream_sink);
 }
 
 pub fn run(diag: *ErrorReport) !void {
@@ -34,5 +35,5 @@ pub fn run(diag: *ErrorReport) !void {
     };
     defer allocator.free(prompt);
 
-    try runWithPrompt(allocator, diag, prompt, null, null);
+    try runWithPrompt(allocator, diag, prompt, null, null, null);
 }
