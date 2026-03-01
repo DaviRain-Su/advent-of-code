@@ -110,6 +110,9 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
     var history_view = TextView{};
     var log_view = TextView{};
 
+    history_view.scroll_view.vertical_scrollbar = null;
+    log_view.scroll_view.vertical_scrollbar = null;
+
     var output = std.ArrayList(u8){};
     defer output.deinit(allocator);
 
@@ -402,6 +405,27 @@ fn drawPanel(panel: vaxis.Window, view: *TextView, buffer: *TextView.Buffer, tit
 
     content_win.fill(.{ .style = theme.bg });
     view.draw(content_win, buffer.*);
+
+    const visible_rows = content_win.height;
+    if (buffer.rows > visible_rows and panel.width > 1) {
+        const max_scroll_y = buffer.rows -| visible_rows;
+        const scroll_y = view.scroll_view.scroll.y;
+        const at_top = scroll_y == 0;
+        const at_bottom = scroll_y >= max_scroll_y;
+        const indicator = if (!at_top and !at_bottom)
+            "↕"
+        else if (!at_top)
+            "↑"
+        else if (!at_bottom)
+            "↓"
+        else
+            "";
+        if (indicator.len > 0) {
+            const col = @max(panel.width - 2, 0);
+            const indicator_segment = vaxis.Cell.Segment{ .text = indicator, .style = theme.status };
+            _ = panel.printSegment(indicator_segment, .{ .row_offset = 0, .col_offset = @intCast(col), .wrap = .none });
+        }
+    }
 }
 
 fn handleScrollKey(key: Key, focus: FocusPanel, history_view: *TextView, log_view: *TextView) bool {
