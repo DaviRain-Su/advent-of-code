@@ -47,6 +47,19 @@ fn focusLabel(focus: FocusPanel) []const u8 {
     };
 }
 
+fn resolveModelLabel() []const u8 {
+    if (std.posix.getenv("OPENROUTER_MODEL")) |model| {
+        if (model.len > 0) return model;
+    }
+
+    const base_url = std.posix.getenv("OPENROUTER_BASE_URL") orelse ConfigMod.Defaults.default_base_url;
+    if (std.mem.indexOf(u8, base_url, "deepseek") != null) {
+        return ConfigMod.Defaults.default_deepseek_model;
+    }
+
+    return ConfigMod.Defaults.default_openai_model;
+}
+
 const LogState = struct {
     allocator: std.mem.Allocator,
     buffer: *TextView.Buffer,
@@ -121,7 +134,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
     try appendPlain(allocator, &log_buffer, "Ready.\n");
 
     var status_buf: [160]u8 = undefined;
-    const status_line = std.fmt.bufPrint(&status_buf, "Model: {s}  Focus: {s}", .{ ConfigMod.Defaults.default_openai_model, focusLabel(focus) }) catch "";
+    const status_line = std.fmt.bufPrint(&status_buf, "Model: {s}  Focus: {s}", .{ resolveModelLabel(), focusLabel(focus) }) catch "";
 
     try render(&vx, tty.writer(), .{
         .input = &input,
@@ -209,14 +222,14 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                                 mode = .running;
 
                                 try appendStyled(allocator, &history_buffer, theme.user, "User: ");
-                                try appendPlain(allocator, &history_buffer, prompt);
+                                try appendStyled(allocator, &history_buffer, theme.user, prompt);
                                 try appendPlain(allocator, &history_buffer, "\n");
                                 scrollToBottom(&history_view, &history_buffer);
                                 try appendPlain(allocator, &log_buffer, "Running prompt...\n");
                                 scrollToBottom(&log_view, &log_buffer);
 
                                 var status_buf_running: [160]u8 = undefined;
-                                const status_line_running = std.fmt.bufPrint(&status_buf_running, "Model: {s}  Focus: {s}  Status: running", .{ ConfigMod.Defaults.default_openai_model, focusLabel(focus) }) catch "";
+                                const status_line_running = std.fmt.bufPrint(&status_buf_running, "Model: {s}  Focus: {s}  Status: running", .{ resolveModelLabel(), focusLabel(focus) }) catch "";
 
                                 try render(&vx, tty.writer(), .{
                                     .input = &input,
@@ -242,7 +255,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
 
                                 if (output.items.len > 0) {
                                     try appendStyled(allocator, &history_buffer, theme.assistant, "Assistant: ");
-                                    try appendPlain(allocator, &history_buffer, output.items);
+                                    try appendStyled(allocator, &history_buffer, theme.assistant, output.items);
                                     try appendPlain(allocator, &history_buffer, "\n");
                                     scrollToBottom(&history_view, &history_buffer);
                                 }
@@ -265,7 +278,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
         }
 
         var status_buf_loop: [160]u8 = undefined;
-        const status_line_loop = std.fmt.bufPrint(&status_buf_loop, "Model: {s}  Focus: {s}", .{ ConfigMod.Defaults.default_openai_model, focusLabel(focus) }) catch "";
+        const status_line_loop = std.fmt.bufPrint(&status_buf_loop, "Model: {s}  Focus: {s}", .{ resolveModelLabel(), focusLabel(focus) }) catch "";
 
         try render(&vx, tty.writer(), .{
             .input = &input,
