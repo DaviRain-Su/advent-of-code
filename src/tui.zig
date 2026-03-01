@@ -3,116 +3,16 @@ const vaxis = @import("vaxis");
 const builtin = @import("builtin");
 
 const App = @import("app.zig");
-const Agent = @import("agent.zig");
 const Errors = @import("errors.zig");
 const ErrorReport = Errors.ErrorReport;
-const ConfigMod = @import("config.zig");
+const Controller = @import("tui_controller.zig");
+
 const Key = vaxis.Key;
 
 const Event = union(enum) {
     key_press: Key,
     winsize: vaxis.Winsize,
 };
-
-const UiMode = enum {
-    input,
-    running,
-};
-
-const Role = enum {
-    user,
-    assistant,
-    system,
-};
-
-const Message = struct {
-    role: Role,
-    content: []const u8,
-};
-
-const Theme = struct {
-    bg: vaxis.Style = .{ .fg = .default, .bg = .{ .index = 0 } },
-    title_bar: vaxis.Style = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 6 }, .bold = true },
-    separator: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 0 } },
-    user: vaxis.Style = .{ .fg = .{ .index = 2 }, .bg = .{ .index = 0 }, .bold = true },
-    assistant: vaxis.Style = .{ .fg = .{ .index = 4 }, .bg = .{ .index = 0 } },
-    system: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 0 } },
-    input_prompt: vaxis.Style = .{ .fg = .{ .index = 3 }, .bg = .{ .index = 0 }, .bold = true },
-    input_text: vaxis.Style = .{ .fg = .{ .index = 15 }, .bg = .{ .index = 0 } },
-};
-
-fn resolveModelLabel() []const u8 {
-    if (std.posix.getenv("OPENROUTER_MODEL")) |model| {
-        if (model.len > 0) return model;
-    }
-
-    const base_url = std.posix.getenv("OPENROUTER_BASE_URL") orelse ConfigMod.Defaults.default_base_url;
-    if (std.mem.indexOf(u8, base_url, "deepseek") != null) {
-        return ConfigMod.Defaults.default_deepseek_model;
-    }
-
-    return ConfigMod.Defaults.default_openai_model;
-}
-
-const TuiState = struct {
-    allocator: std.mem.Allocator,
-    messages: std.ArrayList(Message),
-    theme: Theme,
-    input_buffer: std.ArrayList(u8),
-    input_history: std.ArrayList([]const u8),
-    history_index: ?usize,
-    output: std.ArrayList(u8),
-    mode: UiMode,
-    crash_log: ?std.fs.File,
-
-    fn init(allocator: std.mem.Allocator, theme: Theme) TuiState {
-        return .{
-            .allocator = allocator,
-            .messages = std.ArrayList(Message){},
-            .theme = theme,
-            .input_buffer = std.ArrayList(u8){},
-            .input_history = std.ArrayList([]const u8){},
-            .history_index = null,
-            .output = std.ArrayList(u8){},
-            .mode = .input,
-            .crash_log = null,
-        };
-    }
-
-    fn deinit(self: *TuiState) void {
-        for (self.messages.items) |msg| {
-            self.allocator.free(msg.content);
-        }
-        self.messages.deinit(self.allocator);
-
-        self.input_buffer.deinit(self.allocator);
-
-        for (self.input_history.items) |item| {
-            self.allocator.free(item);
-        }
-        self.input_history.deinit(self.allocator);
-
-        self.output.deinit(self.allocator);
-
-        if (self.crash_log) |file| {
-            file.close();
-        }
-    }
-
-    fn log(self: *const TuiState, comptime fmt: []const u8, args: anytype) void {
-        if (self.crash_log) |file| {
-            var mutable = file;
-            logCrash(&mutable, fmt, args);
-        }
-    }
-};
-
-fn logCrash(file: *std.fs.File, comptime fmt: []const u8, args: anytype) void {
-    var buf: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = file.write(line) catch {};
-    _ = file.write("\n") catch {};
-}
 
 fn probeTTY() ?std.posix.E {
     const path = "/dev/tty" ++ [_]u8{0};
@@ -137,17 +37,22 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
         return error.TuiUnavailable;
     }
 
-    var state = TuiState.init(allocator, .{});
-    defer state.deinit();
+    var controller = Controller.TuiController.init(allocator, .{});
+    defer controller.deinit();
 
-    state.crash_log = std.fs.cwd().createFile("/tmp/claude_tui_crash.log", .{ .truncate = true }) catch null;
+    if (std.fs.cwd().createFile("/tmp/claude_tui_crash.log", .{ .truncate = true })) |file| {
+        controller.setCrashLog(file);
+    } else |_| {
+        // optional debug log, best-effort only
+    }
+
     errdefer |err| {
-        state.log("tui error: {s}", .{@errorName(err)});
+        controller.log("tui error: {s}", .{@errorName(err)});
     }
 
     if (builtin.os.tag != .windows) {
         if (probeTTY()) |err| {
-            state.log("tui preflight failed open /dev/tty: {s}", .{@tagName(err)});
+            controller.log("tui preflight failed open /dev/tty: {s}", .{@tagName(err)});
             diag.setBorrowed(.usage, "TUI requires a controlling terminal (/dev/tty). Use -p for CLI mode.");
             return error.TuiUnavailable;
         }
@@ -155,7 +60,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
 
     var tty_buffer: [4096]u8 = undefined;
     var tty = vaxis.Tty.init(tty_buffer[0..]) catch |err| {
-        state.log("Failed to initialize TUI: {s}", .{@errorName(err)});
+        controller.log("Failed to initialize TUI: {s}", .{@errorName(err)});
         diag.setf(.usage, "Failed to initialize TUI: {any}", .{err}) catch {};
         return error.TuiUnavailable;
     };
@@ -185,12 +90,8 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
         }
     }
 
-    try appendMessage(allocator, &state.messages, .system, "Welcome to Claude Code TUI.");
-    try appendMessage(allocator, &state.messages, .system, "Ready.");
-
-    try render(&vx, tty.writer(), &state);
-
-    const sink = Agent.LogSink{ .ctx = &state, .write = logSinkWrite };
+    try controller.appendStartupMessages();
+    try render(&vx, tty.writer(), &controller.state);
 
     while (true) {
         const event = loop.nextEvent();
@@ -201,139 +102,67 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                 vx.queueRefresh();
             },
             .key_press => |key| {
-                const should_continue = try handleKeyEvent(allocator, &vx, tty.writer(), &state, key, sink, diag);
-                if (!should_continue) {
-                    return error.UsageError;
+                const action = try controller.handleKeyEvent(allocator, key, diag);
+                switch (action) {
+                    .exit => {
+                        return error.UsageError;
+                    },
+                    .submit => if (controller.consumePendingPrompt()) |prompt| {
+                        defer allocator.free(prompt);
+                        try executePrompt(allocator, diag, &controller, &vx, tty.writer(), prompt);
+                    },
+                    .none => {},
                 }
             },
         }
 
-        render(&vx, tty.writer(), &state) catch |err| {
-            state.log("render loop failed: {s}", .{@errorName(err)});
+        render(&vx, tty.writer(), &controller.state) catch |err| {
+            controller.log("render loop failed: {s}", .{@errorName(err)});
             diag.setf(.usage, "TUI render failed: {s}", .{@errorName(err)}) catch {};
             return error.TuiUnavailable;
         };
     }
 }
 
-fn handleKeyEvent(
+fn executePrompt(
     allocator: std.mem.Allocator,
+    diag: *ErrorReport,
+    controller: *Controller.TuiController,
     vx: *vaxis.Vaxis,
     writer: *std.Io.Writer,
-    state: *TuiState,
-    key: Key,
-    sink: Agent.LogSink,
-    diag: *ErrorReport,
-) !bool {
-    if (state.mode == .running) {
-        if (key.matches('c', .{ .ctrl = true })) {
-            diag.setBorrowed(.usage, "Prompt cancelled");
-            return false;
-        }
-        return true;
-    }
-
-    if (key.matches(Key.up, .{})) {
-        try navigateHistoryUp(allocator, state);
-    } else if (key.matches(Key.down, .{})) {
-        try navigateHistoryDown(allocator, state);
-    } else if (key.matches(Key.backspace, .{})) {
-        _ = popUtf8Char(&state.input_buffer);
-    } else if (key.matches(Key.enter, .{}) or key.matches(Key.kp_enter, .{})) {
-        try submitPrompt(allocator, vx, writer, state, diag, sink);
-    } else if (key.matches('c', .{ .ctrl = true })) {
-        diag.setBorrowed(.usage, "Prompt cancelled");
-        return false;
-    } else if (key.text) |text| {
-        try state.input_buffer.appendSlice(allocator, text);
-    }
-
-    return true;
-}
-
-fn navigateHistoryUp(allocator: std.mem.Allocator, state: *TuiState) !void {
-    if (state.input_history.items.len == 0) return;
-
-    if (state.history_index == null) {
-        state.history_index = state.input_history.items.len - 1;
-    } else if (state.history_index.? > 0) {
-        state.history_index = state.history_index.? - 1;
-    }
-
-    const idx = state.history_index.?;
-    try setInputBuffer(allocator, &state.input_buffer, state.input_history.items[idx]);
-}
-
-fn navigateHistoryDown(allocator: std.mem.Allocator, state: *TuiState) !void {
-    if (state.history_index) |idx| {
-        if (idx + 1 < state.input_history.items.len) {
-            state.history_index = idx + 1;
-            try setInputBuffer(allocator, &state.input_buffer, state.input_history.items[state.history_index.?]);
-        } else {
-            state.history_index = null;
-            state.input_buffer.clearRetainingCapacity();
-        }
-    }
-}
-
-fn submitPrompt(
-    allocator: std.mem.Allocator,
-    vx: *vaxis.Vaxis,
-    writer: *std.Io.Writer,
-    state: *TuiState,
-    diag: *ErrorReport,
-    sink: Agent.LogSink,
+    prompt: []const u8,
 ) !void {
-    if (state.input_buffer.items.len == 0) {
-        try appendMessage(allocator, &state.messages, .system, "Prompt cannot be empty.");
-        return;
-    }
-
-    const prompt = try allocator.dupe(u8, state.input_buffer.items);
-    defer allocator.free(prompt);
-
-    try state.input_history.append(allocator, try allocator.dupe(u8, prompt));
-    state.history_index = null;
-
-    state.input_buffer.clearRetainingCapacity();
-    state.output.clearRetainingCapacity();
-    state.mode = .running;
-
-    try appendMessage(allocator, &state.messages, .user, prompt);
-    try appendMessage(allocator, &state.messages, .system, "Running prompt...");
-
-    render(vx, writer, state) catch |err| {
-        state.log("render before runWithPrompt failed: {s}", .{@errorName(err)});
+    render(vx, writer, &controller.state) catch |err| {
+        controller.log("render before runWithPrompt failed: {s}", .{@errorName(err)});
         diag.setf(.usage, "TUI render failed: {s}", .{@errorName(err)}) catch {};
         return error.TuiUnavailable;
     };
 
-    state.log("runWithPrompt start len={d}", .{prompt.len});
+    var run_error: ?[]const u8 = null;
+    controller.log("runWithPrompt start len={d}", .{prompt.len});
 
-    App.runWithPrompt(allocator, diag, prompt, &state.output, sink) catch |err| {
-        state.output.clearRetainingCapacity();
+    App.runWithPrompt(allocator, diag, prompt, &controller.state.output, controller.logSink()) catch |err| {
+        controller.state.output.clearRetainingCapacity();
         const msg = try allocator.dupe(u8, Errors.userFacingMessage(allocator, err, diag) catch "Unexpected runtime error");
-        defer allocator.free(msg);
-        state.log("runWithPrompt error: {s}", .{@errorName(err)});
-        state.log("details: {s}", .{msg});
-        try appendMessage(allocator, &state.messages, .system, msg);
-        try state.output.appendSlice(allocator, msg);
+        controller.log("runWithPrompt error: {s}", .{@errorName(err)});
+        controller.log("details: {s}", .{msg});
+        try controller.appendMessage(.system, msg);
+        try controller.state.output.appendSlice(allocator, msg);
+        run_error = msg;
     };
 
-    state.log("runWithPrompt end len={d}", .{state.output.items.len});
+    controller.log("runWithPrompt end len={d}", .{controller.state.output.items.len});
+    try controller.finishRun();
 
-    if (state.output.items.len > 0) {
-        try appendMessage(allocator, &state.messages, .assistant, state.output.items);
+    if (run_error) |msg| {
+        allocator.free(msg);
     }
-
-    try appendMessage(allocator, &state.messages, .system, "Done.");
-    state.mode = .input;
 }
 
 fn render(
     vx: *vaxis.Vaxis,
     writer: *std.Io.Writer,
-    state: *const TuiState,
+    state: *const Controller.TuiState,
 ) !void {
     const win = vx.window();
     win.fill(.{ .style = state.theme.bg });
@@ -373,7 +202,7 @@ fn render(
     try writer.flush();
 }
 
-fn totalMessageLines(messages: []const Message, max_content_width: usize) usize {
+fn totalMessageLines(messages: []const Controller.Message, max_content_width: usize) usize {
     var total_lines: usize = 0;
     for (messages) |msg| {
         var iter = std.mem.splitScalar(u8, msg.content, '\n');
@@ -386,8 +215,8 @@ fn totalMessageLines(messages: []const Message, max_content_width: usize) usize 
 
 fn renderMessages(
     win: vaxis.Window,
-    messages: []const Message,
-    theme: Theme,
+    messages: []const Controller.Message,
+    theme: Controller.Theme,
     max_content_width: usize,
     message_area_height: u16,
     lines_to_skip: usize,
@@ -462,7 +291,7 @@ fn renderInputRow(
     win: vaxis.Window,
     width: u16,
     input_row: u16,
-    state: *const TuiState,
+    state: *const Controller.TuiState,
 ) void {
     const input_prefix = vaxis.Segment{ .text = "> ", .style = state.theme.input_prompt };
     _ = win.print(&.{input_prefix}, .{ .row_offset = input_row, .col_offset = 0, .wrap = .none });
@@ -479,7 +308,7 @@ fn renderInputRow(
     win.showCursor(cursor_col, input_row);
 }
 
-fn rolePrefix(role: Role) []const u8 {
+fn rolePrefix(role: Controller.Role) []const u8 {
     return switch (role) {
         .user => "> ",
         .assistant => "< ",
@@ -487,7 +316,7 @@ fn rolePrefix(role: Role) []const u8 {
     };
 }
 
-fn roleStyle(role: Role, theme: Theme) vaxis.Style {
+fn roleStyle(role: Controller.Role, theme: Controller.Theme) vaxis.Style {
     return switch (role) {
         .user => theme.user,
         .assistant => theme.assistant,
@@ -495,7 +324,7 @@ fn roleStyle(role: Role, theme: Theme) vaxis.Style {
     };
 }
 
-fn drawTitleBar(win: vaxis.Window, width: u16, theme: Theme) void {
+fn drawTitleBar(win: vaxis.Window, width: u16, theme: Controller.Theme) void {
     var col: u16 = 0;
     while (col < width) : (col += 1) {
         win.writeCell(col, 0, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = theme.title_bar });
@@ -509,45 +338,11 @@ fn drawTitleBar(win: vaxis.Window, width: u16, theme: Theme) void {
     _ = win.print(&.{title_seg}, .{ .row_offset = 0, .col_offset = start_col, .wrap = .none });
 }
 
-fn drawSeparator(win: vaxis.Window, width: u16, row: u16, theme: Theme) void {
+fn drawSeparator(win: vaxis.Window, width: u16, row: u16, theme: Controller.Theme) void {
     var col: u16 = 0;
     while (col < width) : (col += 1) {
         win.writeCell(col, row, .{ .char = .{ .grapheme = "-", .width = 1 }, .style = theme.separator });
     }
-}
-
-fn appendMessage(allocator: std.mem.Allocator, messages: *std.ArrayList(Message), role: Role, content: []const u8) !void {
-    try messages.append(allocator, .{ .role = role, .content = try allocator.dupe(u8, content) });
-}
-
-fn setInputBuffer(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), text: []const u8) !void {
-    buffer.clearRetainingCapacity();
-    if (text.len == 0) return;
-    try buffer.appendSlice(allocator, text);
-}
-
-fn popUtf8Char(buffer: *std.ArrayList(u8)) usize {
-    if (buffer.items.len == 0) return 0;
-
-    var index = buffer.items.len - 1;
-    while (index > 0 and (buffer.items[index] & 0xC0) == 0x80) {
-        index -= 1;
-    }
-
-    const removed = buffer.items.len - index;
-    buffer.shrinkRetainingCapacity(index);
-    return removed;
-}
-
-fn displayWidth(bytes: []const u8) usize {
-    var width: usize = 0;
-    var iter = std.unicode.Utf8Iterator{ .bytes = bytes, .i = 0 };
-    while (iter.nextCodepoint()) |cp| {
-        var buf: [4]u8 = undefined;
-        const len = std.unicode.utf8Encode(cp, &buf) catch 1;
-        width +|= vaxis.gwidth.gwidth(buf[0..len], .unicode);
-    }
-    return width;
 }
 
 fn countWrappedLines(line: []const u8, max_width: usize) usize {
@@ -567,6 +362,17 @@ fn countWrappedLines(line: []const u8, max_width: usize) usize {
     }
 
     return count;
+}
+
+fn displayWidth(bytes: []const u8) usize {
+    var width: usize = 0;
+    var iter = std.unicode.Utf8Iterator{ .bytes = bytes, .i = 0 };
+    while (iter.nextCodepoint()) |cp| {
+        var buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(cp, &buf) catch 1;
+        width +|= vaxis.gwidth.gwidth(buf[0..len], .unicode);
+    }
+    return width;
 }
 
 fn tailSliceByDisplayWidth(bytes: []const u8, max_width: usize) []const u8 {
@@ -612,13 +418,4 @@ fn headSliceByDisplayWidth(bytes: []const u8, max_width: usize) []const u8 {
     }
 
     return bytes[0..end];
-}
-
-fn logSinkWrite(ctx: *anyopaque, msg: []const u8) void {
-    const state: *TuiState = @ptrCast(@alignCast(ctx));
-    var it = std.mem.splitScalar(u8, msg, '\n');
-    while (it.next()) |line| {
-        if (line.len == 0) continue;
-        appendMessage(state.allocator, &state.messages, .system, line) catch {};
-    }
 }
