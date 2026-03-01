@@ -6,7 +6,6 @@ const AppError = error{
     MissingField,
     InvalidType,
     InvalidToolCallsShape,
-    EmptyToolCalls,
     UnsupportedFunction,
     NoChoices,
     RequestedFileNotFound,
@@ -97,6 +96,7 @@ const Defaults = struct {
     const read_tool_type = "function";
     const read_file_param = "file_path";
     const read_tool_description = "Read and return the contents of a file";
+    const max_agent_iterations: u8 = 16;
 };
 
 const ToolFunction = struct {
@@ -179,11 +179,14 @@ fn parsePrompt(allocator: std.mem.Allocator, diag: *ErrorReport) ![]const u8 {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 3 or !std.mem.eql(u8, args[1], "-p")) {
-        diag.setBorrowed(.usage, "Usage: main -p <prompt>");
+        diag.setBorrowed(.usage, "Usage: main -p <prompt...>");
         return error.UsageError;
     }
 
-    return try allocator.dupe(u8, args[2]);
+    // Allow prompts passed as `-p` followed by one or more shell-quoted pieces.
+    // Joining keeps the original behavior for single-argument prompts while making
+    // multi-argument invocations robust.
+    return try std.mem.join(allocator, " ", args[2..]);
 }
 
 fn writeAll(diag: *ErrorReport, data: []const u8) !void {
@@ -504,7 +507,6 @@ fn userFacingMessage(allocator: std.mem.Allocator, err: anyerror, report: *Error
         error.MissingField => "Malformed provider response (missing expected JSON field)",
         error.InvalidType => "Malformed provider response (unexpected JSON type)",
         error.InvalidToolCallsShape => "Malformed tool-calls payload shape",
-        error.EmptyToolCalls => "Tool calls array is empty",
         error.UnsupportedFunction => "Unsupported tool function",
         error.NoChoices => "Provider returned no choices",
         error.RequestedFileNotFound => "Requested file was not found",
@@ -555,7 +557,7 @@ fn run(diag: *ErrorReport) !void {
     try messages.append(allocator, .{ .role = "user", .content = try allocator.dupe(u8, prompt) });
 
     var iterations: u8 = 0;
-    while (iterations < 16) : (iterations += 1) {
+    while (iterations < Defaults.max_agent_iterations) : (iterations += 1) {
         const response_body = sendCompletionRequest(allocator, diag, config, messages.items) catch |err| {
             switch (err) {
                 error.HttpError => return err,
