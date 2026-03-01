@@ -32,7 +32,6 @@ const Message = struct {
 const Theme = struct {
     bg: vaxis.Style = .{ .fg = .default, .bg = .{ .index = 0 } },
     title_bar: vaxis.Style = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 6 }, .bold = true },
-    status_bar: vaxis.Style = .{ .fg = .{ .index = 15 }, .bg = .{ .index = 8 } },
     separator: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 0 } },
     user: vaxis.Style = .{ .fg = .{ .index = 2 }, .bg = .{ .index = 0 }, .bold = true },
     assistant: vaxis.Style = .{ .fg = .{ .index = 4 }, .bg = .{ .index = 0 } },
@@ -248,7 +247,7 @@ fn render(
 
     drawTitleBar(win, width, theme);
 
-    const message_area_height: u16 = @intCast(height - 5);
+    const message_area_height: u16 = @intCast(height - 3);
     const max_content_width: usize = if (width > 2) @as(usize, width) - 2 else 0;
 
     var total_lines: usize = 0;
@@ -303,10 +302,10 @@ fn render(
         }
     }
 
-    const sep_row: u16 = @intCast(height - 4);
+    const sep_row: u16 = @intCast(height - 2);
     drawSeparator(win, width, sep_row, theme);
 
-    const input_row: u16 = @intCast(height - 3);
+    const input_row: u16 = @intCast(height - 1);
     const input_prefix = vaxis.Segment{ .text = "> ", .style = theme.input_prompt };
     _ = win.print(&.{input_prefix}, .{ .row_offset = input_row, .col_offset = 0, .wrap = .none });
 
@@ -321,11 +320,7 @@ fn render(
     const cursor_col: u16 = @intCast(@min(display_len + 2, width - 1));
     win.showCursor(cursor_col, input_row);
 
-    const status_sep_row: u16 = @intCast(height - 2);
-    drawSeparator(win, width, status_sep_row, theme);
-
-    const status_row: u16 = @intCast(height - 1);
-    drawStatusBar(win, width, status_row, mode, theme);
+    _ = mode;
 
     try vx.render(writer);
     try writer.flush();
@@ -337,10 +332,11 @@ fn drawTitleBar(win: vaxis.Window, width: u16, theme: Theme) void {
         win.writeCell(col, 0, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = theme.title_bar });
     }
 
-    const title = " Claude Code ";
-    const title_len: u16 = @intCast(title.len);
+    var title_buf: [200]u8 = undefined;
+    const title_text = std.fmt.bufPrint(&title_buf, " Claude Code  ({s}) ", .{resolveModelLabel()}) catch " Claude Code ";
+    const title_len: u16 = @intCast(title_text.len);
     const start_col: u16 = if (width > title_len) (width - title_len) / 2 else 0;
-    const title_seg = vaxis.Segment{ .text = title, .style = theme.title_bar };
+    const title_seg = vaxis.Segment{ .text = title_text, .style = theme.title_bar };
     _ = win.print(&.{title_seg}, .{ .row_offset = 0, .col_offset = start_col, .wrap = .none });
 }
 
@@ -349,23 +345,6 @@ fn drawSeparator(win: vaxis.Window, width: u16, row: u16, theme: Theme) void {
     while (col < width) : (col += 1) {
         win.writeCell(col, row, .{ .char = .{ .grapheme = "─", .width = 1 }, .style = theme.separator });
     }
-}
-
-fn drawStatusBar(win: vaxis.Window, width: u16, row: u16, mode: UiMode, theme: Theme) void {
-    var col: u16 = 0;
-    while (col < width) : (col += 1) {
-        win.writeCell(col, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = theme.status_bar });
-    }
-
-    var status_buf: [256]u8 = undefined;
-    const status_text = std.fmt.bufPrint(
-        &status_buf,
-        " Model: {s} | Status: {s} ",
-        .{ resolveModelLabel(), if (mode == .running) "running" else "input" },
-    ) catch " Status ";
-
-    const status_seg = vaxis.Segment{ .text = status_text, .style = theme.status_bar };
-    _ = win.print(&.{status_seg}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
 }
 
 fn appendMessage(allocator: std.mem.Allocator, messages: *std.ArrayList(Message), role: Role, content: []const u8) !void {
