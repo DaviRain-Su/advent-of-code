@@ -5,6 +5,7 @@ const App = @import("app.zig");
 const Agent = @import("agent.zig");
 const Errors = @import("errors.zig");
 const ErrorReport = Errors.ErrorReport;
+const ConfigMod = @import("config.zig");
 const Key = vaxis.Key;
 const TextInput = vaxis.widgets.TextInput;
 const TextView = vaxis.widgets.TextView;
@@ -37,6 +38,14 @@ const Theme = struct {
     tool: vaxis.Style = .{ .fg = .{ .index = 14 }, .bg = .{ .index = 0 } },
     error_style: vaxis.Style = .{ .fg = .{ .index = 9 }, .bg = .{ .index = 0 }, .bold = true },
 };
+
+fn focusLabel(focus: FocusPanel) []const u8 {
+    return switch (focus) {
+        .input => "Input",
+        .history => "History",
+        .logs => "Logs",
+    };
+}
 
 const LogState = struct {
     allocator: std.mem.Allocator,
@@ -111,6 +120,9 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
     try appendPlain(allocator, &history_buffer, "Welcome to Claude Code TUI.\n");
     try appendPlain(allocator, &log_buffer, "Ready.\n");
 
+    var status_buf: [160]u8 = undefined;
+    const status_line = std.fmt.bufPrint(&status_buf, "Model: {s}  Focus: {s}", .{ ConfigMod.Defaults.default_openai_model, focusLabel(focus) }) catch "";
+
     try render(&vx, tty.writer(), .{
         .input = &input,
         .history_view = &history_view,
@@ -119,6 +131,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
         .log_buffer = &log_buffer,
         .focus = focus,
         .theme = theme,
+        .status_line = status_line,
     });
 
     var log_state = LogState{ .allocator = allocator, .buffer = &log_buffer, .view = &log_view, .theme = theme };
@@ -202,6 +215,9 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                                 try appendPlain(allocator, &log_buffer, "Running prompt...\n");
                                 scrollToBottom(&log_view, &log_buffer);
 
+                                var status_buf_running: [160]u8 = undefined;
+                                const status_line_running = std.fmt.bufPrint(&status_buf_running, "Model: {s}  Focus: {s}  Status: running", .{ ConfigMod.Defaults.default_openai_model, focusLabel(focus) }) catch "";
+
                                 try render(&vx, tty.writer(), .{
                                     .input = &input,
                                     .history_view = &history_view,
@@ -210,6 +226,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                                     .log_buffer = &log_buffer,
                                     .focus = focus,
                                     .theme = theme,
+                                    .status_line = status_line_running,
                                 });
 
                                 App.runWithPrompt(allocator, diag, prompt, &output, sink) catch |err| {
@@ -247,6 +264,9 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
             },
         }
 
+        var status_buf_loop: [160]u8 = undefined;
+        const status_line_loop = std.fmt.bufPrint(&status_buf_loop, "Model: {s}  Focus: {s}", .{ ConfigMod.Defaults.default_openai_model, focusLabel(focus) }) catch "";
+
         try render(&vx, tty.writer(), .{
             .input = &input,
             .history_view = &history_view,
@@ -255,6 +275,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
             .log_buffer = &log_buffer,
             .focus = focus,
             .theme = theme,
+            .status_line = status_line_loop,
         });
     }
 }
@@ -267,6 +288,7 @@ const RenderState = struct {
     log_buffer: *TextView.Buffer,
     focus: FocusPanel,
     theme: Theme,
+    status_line: []const u8,
 };
 
 fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !void {
@@ -280,7 +302,10 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
         return;
     }
 
-    const content_start: usize = 0;
+    const status_segment = vaxis.Cell.Segment{ .text = state.status_line, .style = state.theme.status };
+    _ = win.printSegment(status_segment, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
+
+    const content_start: usize = 1;
     const content_height: usize = total_height - 2;
     const split_col: usize = total_width * 3 / 4;
 
@@ -321,7 +346,7 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
             state.theme.border;
         var row: usize = 0;
         while (row < content_height) : (row += 1) {
-            win.writeCell(@intCast(split_col), @intCast(row), .{ .char = .{ .grapheme = "│", .width = 1 }, .style = line_style });
+            win.writeCell(@intCast(split_col), @intCast(row + content_start), .{ .char = .{ .grapheme = "│", .width = 1 }, .style = line_style });
         }
     }
 
@@ -341,11 +366,7 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
     const input_child = input_win.child(.{ .x_off = @intCast(label_len), .y_off = 0, .width = @intCast(@max(total_width - label_len, 1)), .height = 1 });
     input_child.fill(.{ .style = state.theme.bg });
     state.input.draw(input_child);
-    if (state.focus == .input) {
-        input_child.showCursor(state.input.prev_cursor_col, 0);
-    } else {
-        input_child.hideCursor();
-    }
+    input_child.showCursor(state.input.prev_cursor_col, 0);
 
     try vx.render(tty_writer);
 }
