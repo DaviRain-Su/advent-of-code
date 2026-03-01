@@ -1,56 +1,109 @@
 const std = @import("std");
 
-fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-}
+const Config = struct {
+    api_key: []const u8,
+    base_url: []const u8,
+    model: []const u8,
+};
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+const Defaults = struct {
+    const default_base_url = "https://openrouter.ai/api/v1";
+    const default_openai_model = "anthropic/claude-haiku-4.5";
+    const default_deepseek_model = "deepseek-chat";
+    const read_tool_name = "Read";
+    const read_file_param = "file_path";
+    const read_tool_description = "Read and return the contents of a file";
+};
 
+fn parsePrompt(allocator: std.mem.Allocator) ![]const u8 {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 3 or !std.mem.eql(u8, args[1], "-p")) {
         @panic("Usage: main -p <prompt>");
     }
-    const prompt_str = args[2];
 
+    return try allocator.dupe(u8, args[2]);
+}
+
+fn loadConfig() Config {
     const api_key = std.posix.getenv("OPENROUTER_API_KEY") orelse @panic("OPENROUTER_API_KEY is not set");
-    const base_url = std.posix.getenv("OPENROUTER_BASE_URL") orelse "https://openrouter.ai/api/v1";
-    const default_model = if (std.mem.indexOf(u8, base_url, "deepseek") != null) "deepseek-chat" else "anthropic/claude-haiku-4.5";
-    const model = std.posix.getenv("OPENROUTER_MODEL") orelse default_model;
+    const base_url = std.posix.getenv("OPENROUTER_BASE_URL") orelse Defaults.default_base_url;
+    const default_model = if (std.mem.indexOf(u8, base_url, "deepseek") != null)
+        Defaults.default_deepseek_model
+    else
+        Defaults.default_openai_model;
 
-    // Build request body
+    return .{
+        .api_key = api_key,
+        .base_url = base_url,
+        .model = std.posix.getenv("OPENROUTER_MODEL") orelse default_model,
+    };
+}
+
+fn requireField(obj: std.json.ObjectMap, key: []const u8) std.json.Value {
+    return obj.get(key) orelse @panic("Expected field in response JSON");
+}
+
+fn asString(v: std.json.Value) []const u8 {
+    if (v != .string) @panic("Expected string in response JSON");
+    return v.string;
+}
+
+fn asArray(v: std.json.Value) std.json.Array {
+    if (v != .array) @panic("Expected array in response JSON");
+    return v.array;
+}
+
+fn asObject(v: std.json.Value) std.json.ObjectMap {
+    if (v != .object) @panic("Expected object in response JSON");
+    return v.object;
+}
+
+fn buildRequestBody(allocator: std.mem.Allocator, model: []const u8, prompt: []const u8) ![]u8 {
     var body_out: std.io.Writer.Allocating = .init(allocator);
     defer body_out.deinit();
-    var jw: std.json.Stringify = .{ .writer = &body_out.writer };
+
+    var jw = std.json.Stringify{ .writer = &body_out.writer };
     try jw.write(.{
         .model = model,
         .messages = &[_]struct { role: []const u8, content: []const u8 }{
-            .{ .role = "user", .content = prompt_str },
+            .{ .role = "user", .content = prompt },
         },
-        .tools = &[_]struct { type: []const u8, function: struct { name: []const u8, description: []const u8, parameters: struct {
-            type: []const u8,
-            properties: struct { file_path: struct { type: []const u8, description: []const u8 } },
-            required: []const []const u8,
-        } } }{
-            .{ .type = "function", .function = .{ .name = "Read", .description = "Read and return the contents of a file", .parameters = .{ .type = "object", .properties = .{ .file_path = .{ .type = "string", .description = "The path to the file to read" } }, .required = &[_][]const u8{"file_path"} } } },
+        .tools = &[_]struct { type: []const u8, function: struct {
+            name: []const u8,
+            description: []const u8,
+            parameters: struct {
+                type: []const u8,
+                properties: struct { file_path: struct { type: []const u8, description: []const u8 } },
+                required: []const []const u8,
+            },
+        } }{
+            .{ .type = "function", .function = .{
+                .name = Defaults.read_tool_name,
+                .description = Defaults.read_tool_description,
+                .parameters = .{
+                    .type = "object",
+                    .properties = .{ .file_path = .{ .type = "string", .description = "The path to the file to read" } },
+                    .required = &[_][]const u8{Defaults.read_file_param},
+                },
+            } },
         },
     });
-    const body = body_out.written();
 
-    // Build URL and auth header
-    const url_str = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base_url});
-    defer allocator.free(url_str);
+    return try allocator.dupe(u8, body_out.written());
+}
 
-    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+fn sendCompletionRequest(allocator: std.mem.Allocator, cfg: Config, prompt: []const u8) ![]u8 {
+    const body = try buildRequestBody(allocator, cfg.model, prompt);
+    defer allocator.free(body);
+
+    const url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{cfg.base_url});
+    defer allocator.free(url);
+
+    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{cfg.api_key});
     defer allocator.free(auth_value);
 
-    // Make HTTP request
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
@@ -58,7 +111,7 @@ pub fn main() !void {
     defer response_out.deinit();
 
     _ = try client.fetch(.{
-        .location = .{ .url = url_str },
+        .location = .{ .url = url },
         .method = .POST,
         .payload = body,
         .extra_headers = &.{
@@ -67,129 +120,125 @@ pub fn main() !void {
         },
         .response_writer = &response_out.writer,
     });
-    const response_body = response_out.written();
 
-    // Parse response
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_body, .{});
-    defer parsed.deinit();
+    return try allocator.dupe(u8, response_out.written());
+}
 
-    // Helpful diagnostics if provider returns an error payload.
-    if (parsed.value.object.get("error")) |error_obj| {
+fn throwOnApiError(response_obj: std.json.ObjectMap) void {
+    if (response_obj.get("error")) |error_obj| {
         if (error_obj == .string) {
             @panic(error_obj.string);
         }
         if (error_obj == .object) {
-            if (error_obj.object.get("message")) |err_msg| {
-                if (err_msg == .string) {
-                    @panic(err_msg.string);
+            if (error_obj.object.get("message")) |msg| {
+                if (msg == .string) {
+                    @panic(msg.string);
                 }
             }
         }
         @panic("Request failed");
     }
+}
 
-    const choices_value = parsed.value.object.get("choices") orelse @panic("No choices in response");
-    if (choices_value != .array) {
-        @panic("choices is not an array");
-    }
-    const choices = choices_value.array;
-    if (choices.items.len == 0) {
-        @panic("No choices in response");
-    }
+fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    return try file.readToEndAlloc(allocator, std.math.maxInt(usize));
+}
 
-    const choice = choices.items[0];
-    if (choice != .object) {
-        @panic("choice is not an object");
-    }
-    const message = choice.object.get("message") orelse @panic("No message in choice");
-    if (message != .object) {
-        @panic("message is not an object");
+fn readRequestedFile(allocator: std.mem.Allocator, requested_path: []const u8) ![]u8 {
+    if (readFileAll(allocator, requested_path)) |contents| {
+        return contents;
+    } else |err| {
+        if (err != error.FileNotFound) return err;
     }
 
-    // If tool calls exist, execute the first Read tool call.
-    if (message.object.get("tool_calls")) |tool_calls| {
-        if (tool_calls == .array) {
-            const tool_call_list = tool_calls.array;
-            if (tool_call_list.items.len == 0) {
-                @panic("Empty tool_calls array");
-            }
+    const is_relative_like =
+        std.mem.indexOfScalar(u8, requested_path, '/') == null and
+        std.mem.indexOfScalar(u8, requested_path, '\\') == null;
+    if (!is_relative_like) return error.FileNotFound;
 
-            const tool_call = tool_call_list.items[0];
-            if (tool_call != .object) {
-                @panic("tool_call is not an object");
-            }
+    const src_path = try std.fmt.allocPrint(allocator, "src/{s}", .{requested_path});
+    defer allocator.free(src_path);
 
-            const function_obj = tool_call.object.get("function") orelse @panic("No function in tool_call");
-            if (function_obj != .object) {
-                @panic("function is not an object");
-            }
+    return readFileAll(allocator, src_path);
+}
 
-            const function_name_value = function_obj.object.get("name") orelse @panic("No function name");
-            if (function_name_value != .string) {
-                @panic("Function name is not a string");
-            }
-            if (!std.mem.eql(u8, function_name_value.string, "Read")) {
-                @panic("Unsupported function");
-            }
+fn extractReadToolFilePath(tool_calls: std.json.Value, allocator: std.mem.Allocator) ![]const u8 {
+    const tool_call_list = asArray(tool_calls);
 
-            const arguments_value = function_obj.object.get("arguments") orelse @panic("No arguments");
-            if (arguments_value != .string) {
-                @panic("Arguments are not a string");
-            }
-
-            // Parse tool arguments JSON
-            const args_parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_value.string, .{});
-            defer args_parsed.deinit();
-
-            const file_path_value = args_parsed.value.object.get("file_path") orelse @panic("No file_path in arguments");
-            if (file_path_value != .string) {
-                @panic("file_path is not a string");
-            }
-            const file_path = file_path_value.string;
-
-            // Read file requested by tool call; if that fails, try common fallback paths.
-            var file_contents: ?[]u8 = null;
-            defer {
-                if (file_contents) |contents| {
-                    allocator.free(contents);
-                }
-            }
-
-            file_contents = readFileAll(allocator, file_path) catch |err| blk: {
-                if (err != error.FileNotFound) {
-                    return err;
-                }
-                break :blk null;
-            };
-
-            if (file_contents == null and std.mem.indexOf(u8, file_path, "/") == null and std.mem.indexOf(u8, file_path, "\\") == null) {
-                const src_path = try std.fmt.allocPrint(allocator, "src/{s}", .{file_path});
-                defer allocator.free(src_path);
-                file_contents = readFileAll(allocator, src_path) catch |err| blk: {
-                    if (err != error.FileNotFound) {
-                        return err;
-                    }
-                    break :blk null;
-                };
-            }
-
-            const final_contents = file_contents orelse {
-                @panic("Failed to read requested file path");
-            };
-            try std.fs.File.stdout().writeAll(final_contents);
-            return;
-        } else if (tool_calls != .null) {
-            @panic("tool_calls is not an array");
-        }
+    if (tool_call_list.items.len == 0) {
+        @panic("Empty tool_calls array");
     }
 
-    // No tool calls, output the assistant message content.
-    const content_value = message.object.get("content") orelse @panic("No content in response");
-    if (content_value == .null) {
-        return;
+    const first_tool = asObject(tool_call_list.items[0]);
+    const function_obj = asObject(requireField(first_tool, "function"));
+    const fn_name = asString(requireField(function_obj, "name"));
+
+    if (!std.mem.eql(u8, fn_name, Defaults.read_tool_name)) {
+        @panic("Unsupported function");
     }
-    if (content_value != .string) {
-        @panic("Unexpected content type");
+
+    const args_raw = asString(requireField(function_obj, "arguments"));
+    var parsed_args = try std.json.parseFromSlice(std.json.Value, allocator, args_raw, .{});
+    defer parsed_args.deinit();
+
+    const args_obj = asObject(parsed_args.value);
+    return asString(requireField(args_obj, Defaults.read_file_param));
+}
+
+fn maybeReadToolCall(allocator: std.mem.Allocator, message: std.json.ObjectMap) !bool {
+    const tool_calls = message.get("tool_calls") orelse return false;
+    if (tool_calls == .null) return false;
+    if (tool_calls != .array) @panic("tool_calls is not an array");
+
+    const file_path = try extractReadToolFilePath(tool_calls, allocator);
+
+    const file_contents = readRequestedFile(allocator, file_path) catch |err| {
+        if (err == error.FileNotFound) @panic("Failed to read requested file path");
+        return err;
+    };
+    defer allocator.free(file_contents);
+
+    try std.fs.File.stdout().writeAll(file_contents);
+    return true;
+}
+
+fn printTextContent(message: std.json.ObjectMap) void {
+    const content = requireField(message, "content");
+    if (content == .string) {
+        std.fs.File.stdout().writeAll(content.string) catch @panic("Failed to write output");
     }
-    try std.fs.File.stdout().writeAll(content_value.string);
+}
+
+fn handleAssistantMessage(allocator: std.mem.Allocator, message: std.json.ObjectMap) !void {
+    if (try maybeReadToolCall(allocator, message)) return;
+    printTextContent(message);
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const prompt = try parsePrompt(allocator);
+    defer allocator.free(prompt);
+
+    const config = loadConfig();
+    const response_body = try sendCompletionRequest(allocator, config, prompt);
+    defer allocator.free(response_body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_body, .{});
+    defer parsed.deinit();
+
+    const response_obj = asObject(parsed.value);
+    throwOnApiError(response_obj);
+
+    const choices = asArray(requireField(response_obj, "choices"));
+    if (choices.items.len == 0) @panic("No choices in response");
+
+    const first_choice = asObject(choices.items[0]);
+    const message = asObject(requireField(first_choice, "message"));
+
+    try handleAssistantMessage(allocator, message);
 }
