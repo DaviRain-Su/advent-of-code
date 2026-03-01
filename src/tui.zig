@@ -235,7 +235,7 @@ fn render(
     theme: Theme,
 ) !void {
     const win = vx.window();
-    win.fill(.{ .style = theme.bg });
+    win.clear();
 
     const height = win.height;
     const width = win.width;
@@ -312,7 +312,7 @@ fn render(
     if (input_buffer.items.len > 0) {
         const max_width: usize = if (width > 2) @as(usize, width) - 2 else 0;
         const display = tailSliceByDisplayWidth(input_buffer.items, max_width);
-        const input_seg = vaxis.Cell.Segment{ .text = display, .style = theme.bg };
+        const input_seg = vaxis.Cell.Segment{ .text = display, .style = .{} };
         _ = win.printSegment(input_seg, .{ .row_offset = input_row, .col_offset = 2, .wrap = .none });
     }
 
@@ -327,6 +327,7 @@ fn render(
     drawStatusBar(win, width, status_row, mode, theme);
 
     try vx.render(writer);
+    try writer.flush();
 }
 
 fn drawTitleBar(win: vaxis.Window, width: u16, theme: Theme) void {
