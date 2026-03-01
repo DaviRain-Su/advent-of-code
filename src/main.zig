@@ -6,6 +6,7 @@ const AppError = error{
     MissingField,
     InvalidType,
     InvalidToolCallsShape,
+    InvalidToolArguments,
     UnsupportedFunction,
     NoChoices,
     RequestedFileNotFound,
@@ -202,7 +203,29 @@ fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return try file.readToEndAlloc(allocator, std.math.maxInt(usize));
 }
 
+fn isUnsafeToolPath(path: []const u8) bool {
+    if (path.len == 0) return true;
+
+    if (std.fs.path.isAbsolute(path)) {
+        return true;
+    }
+
+    var it = std.mem.splitAny(u8, path, "/\\");
+    while (it.next()) |segment| {
+        if (segment.len == 2 and std.mem.eql(u8, segment, "..")) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 fn readRequestedFile(allocator: std.mem.Allocator, diag: *ErrorReport, requested_path: []const u8) ![]u8 {
+    if (isUnsafeToolPath(requested_path)) {
+        try diag.setf(.tool, "Tool read path is not allowed: '{s}'", .{requested_path});
+        return error.InvalidToolArguments;
+    }
+
     const attempted = readFileAll(allocator, requested_path) catch |err| switch (err) {
         error.FileNotFound => null,
         else => {
@@ -470,17 +493,27 @@ fn parseAssistantMessage(allocator: std.mem.Allocator, diag: *ErrorReport, messa
     return .{ .content = content, .tool_calls = tool_calls_out };
 }
 
-fn executeToolCall(allocator: std.mem.Allocator, diag: *ErrorReport, tool_call: ToolCall) ![]u8 {
+fn executeToolCall(allocator: std.mem.Allocator, diag: *ErrorReport, call_index: usize, tool_call: ToolCall) ![]u8 {
     const function = tool_call.function;
     if (!std.mem.eql(u8, function.name, Defaults.read_tool_name)) {
-        try diag.setf(.tool, "Unsupported tool function '{s}'", .{function.name});
+        try diag.setf(.tool, "Unsupported tool call #{d} (id={s}): function '{s}' is not supported", .{
+            call_index,
+            tool_call.id,
+            function.name,
+        });
         return error.UnsupportedFunction;
     }
 
-    const file_path = try parseToolArgumentsToPath(allocator, diag, function.arguments);
+    const file_path = parseToolArgumentsToPath(allocator, diag, function.arguments) catch |err| {
+        try diag.setf(.tool, "Tool call #{d} (id={s}) arguments are invalid: {any}", .{ call_index, tool_call.id, err });
+        return err;
+    };
     defer allocator.free(file_path);
 
-    return try readRequestedFile(allocator, diag, file_path);
+    return readRequestedFile(allocator, diag, file_path) catch |err| {
+        try diag.setf(.tool, "Tool call #{d} (id={s}) failed to read '{s}': {any}", .{ call_index, tool_call.id, file_path, err });
+        return err;
+    };
 }
 
 fn formatErrorCategory(kind: ErrorCategory) []const u8 {
@@ -507,6 +540,7 @@ fn userFacingMessage(allocator: std.mem.Allocator, err: anyerror, report: *Error
         error.MissingField => "Malformed provider response (missing expected JSON field)",
         error.InvalidType => "Malformed provider response (unexpected JSON type)",
         error.InvalidToolCallsShape => "Malformed tool-calls payload shape",
+        error.InvalidToolArguments => "Tool arguments are invalid",
         error.UnsupportedFunction => "Unsupported tool function",
         error.NoChoices => "Provider returned no choices",
         error.RequestedFileNotFound => "Requested file was not found",
@@ -560,9 +594,12 @@ fn run(diag: *ErrorReport) !void {
     while (iterations < Defaults.max_agent_iterations) : (iterations += 1) {
         const response_body = sendCompletionRequest(allocator, diag, config, messages.items) catch |err| {
             switch (err) {
-                error.HttpError => return err,
+                error.HttpError => {
+                    try diag.setf(.network, "Request failed at iteration {d}: HTTP request failed", .{iterations});
+                    return error.HttpError;
+                },
                 else => {
-                    diag.setf(.network, "Unexpected network error: {any}", .{err}) catch {};
+                    diag.setf(.network, "Unexpected network error at iteration {d}: {any}", .{ iterations, err }) catch {};
                     return error.HttpError;
                 },
             }
@@ -570,7 +607,7 @@ fn run(diag: *ErrorReport) !void {
         defer allocator.free(response_body);
 
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch |err| {
-            try diag.setf(.json, "Unable to decode provider JSON response body: {any}", .{err});
+            try diag.setf(.json, "Unable to decode provider JSON response (iteration {d}): {any}", .{ iterations, err });
             return error.JsonError;
         };
         defer parsed.deinit();
@@ -587,7 +624,10 @@ fn run(diag: *ErrorReport) !void {
         const first_choice = try Json.asObject(diag, choices.items[0], "response.choices[0]");
         const message_obj = try Json.asObject(diag, try Json.field(diag, first_choice, "message"), "response.choices[0].message");
 
-        const assistant = parseAssistantMessage(allocator, diag, message_obj) catch |err| return err;
+        const assistant = parseAssistantMessage(allocator, diag, message_obj) catch |err| {
+            try diag.setf(.json, "Failed to parse assistant message at iteration {d}: {any}", .{ iterations, err });
+            return err;
+        };
 
         try messages.append(allocator, .{
             .role = "assistant",
@@ -605,8 +645,8 @@ fn run(diag: *ErrorReport) !void {
             break;
         }
 
-        for (assistant.tool_calls.?) |call| {
-            const result = try executeToolCall(allocator, diag, call);
+        for (assistant.tool_calls.?, 0..) |call, call_index| {
+            const result = try executeToolCall(allocator, diag, call_index + 1, call);
             try messages.append(allocator, .{
                 .role = "tool",
                 .tool_call_id = try allocator.dupe(u8, call.id),
@@ -634,6 +674,7 @@ pub fn main() !void {
             error.MissingField,
             error.InvalidType,
             error.InvalidToolCallsShape,
+            error.InvalidToolArguments,
             error.UnsupportedFunction,
             error.NoChoices,
             error.RequestedFileNotFound,
