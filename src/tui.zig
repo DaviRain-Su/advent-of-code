@@ -17,7 +17,6 @@ const Event = union(enum) {
 const UiMode = enum {
     input,
     running,
-    done,
 };
 
 const FocusPanel = enum {
@@ -118,7 +117,6 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
         .log_view = &log_view,
         .history_buffer = &history_buffer,
         .log_buffer = &log_buffer,
-        .mode = mode,
         .focus = focus,
         .theme = theme,
     });
@@ -210,7 +208,6 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                                     .log_view = &log_view,
                                     .history_buffer = &history_buffer,
                                     .log_buffer = &log_buffer,
-                                    .mode = mode,
                                     .focus = focus,
                                     .theme = theme,
                                 });
@@ -235,7 +232,8 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
 
                                 try appendPlain(allocator, &log_buffer, "Done.\n");
                                 scrollToBottom(&log_view, &log_buffer);
-                                mode = .done;
+                                mode = .input;
+                                focus = .input;
                             }
                         } else if (key.matches('c', .{ .ctrl = true })) {
                             diag.setBorrowed(.usage, "Prompt cancelled");
@@ -245,13 +243,6 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                         }
                     },
                     .running => {},
-                    .done => {
-                        if (key.matches(Key.enter, .{}) or key.matches(Key.kp_enter, .{})) {
-                            mode = .input;
-                        } else if (key.matches('q', .{}) or key.matches('c', .{ .ctrl = true })) {
-                            return;
-                        }
-                    },
                 }
             },
         }
@@ -262,7 +253,6 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
             .log_view = &log_view,
             .history_buffer = &history_buffer,
             .log_buffer = &log_buffer,
-            .mode = mode,
             .focus = focus,
             .theme = theme,
         });
@@ -275,7 +265,6 @@ const RenderState = struct {
     log_view: *TextView,
     history_buffer: *TextView.Buffer,
     log_buffer: *TextView.Buffer,
-    mode: UiMode,
     focus: FocusPanel,
     theme: Theme,
 };
@@ -335,18 +324,18 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
 
     const input_row: usize = total_height - 1;
     const input_win = win.child(.{ .x_off = 0, .y_off = @intCast(input_row), .width = @intCast(total_width), .height = 1 });
-    input_win.clear();
+    input_win.fill(.{ .style = state.theme.bg });
 
-    if (state.mode == .input) {
-        const label = vaxis.Cell.Segment{ .text = "Input> ", .style = state.theme.status };
-        _ = input_win.printSegment(label, .{ .row_offset = 0, .col_offset = 0, .wrap = .none });
-        const label_len: u16 = 7;
-        const input_child = input_win.child(.{ .x_off = @intCast(label_len), .y_off = 0, .width = @intCast(@max(total_width - label_len, 1)), .height = 1 });
-        input_child.clear();
-        state.input.draw(input_child);
+    const label = vaxis.Cell.Segment{ .text = "Input> ", .style = state.theme.status };
+    _ = input_win.printSegment(label, .{ .row_offset = 0, .col_offset = 0, .wrap = .none });
+    const label_len: u16 = 7;
+    const input_child = input_win.child(.{ .x_off = @intCast(label_len), .y_off = 0, .width = @intCast(@max(total_width - label_len, 1)), .height = 1 });
+    input_child.fill(.{ .style = state.theme.bg });
+    state.input.draw(input_child);
+    if (state.focus == .input) {
         input_child.showCursor(state.input.prev_cursor_col, 0);
     } else {
-        input_win.hideCursor();
+        input_child.hideCursor();
     }
 
     try vx.render(tty_writer);
@@ -354,6 +343,8 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
 
 fn drawPanel(panel: vaxis.Window, view: *TextView, buffer: *TextView.Buffer, title: []const u8, theme: Theme) void {
     if (panel.width <= 2 or panel.height <= 2) return;
+
+    panel.fill(.{ .style = theme.bg });
 
     const inner = panel.child(.{
         .x_off = 1,
@@ -377,6 +368,7 @@ fn drawPanel(panel: vaxis.Window, view: *TextView, buffer: *TextView.Buffer, tit
         .height = @intCast(inner.height - 1),
     });
 
+    content_win.fill(.{ .style = theme.bg });
     view.draw(content_win, buffer.*);
 }
 
