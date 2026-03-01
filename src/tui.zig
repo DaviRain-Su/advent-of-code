@@ -71,6 +71,13 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
     var input = TextInput.init(allocator);
     defer input.deinit();
 
+    var input_history = std.ArrayList([]const u8){};
+    defer {
+        for (input_history.items) |item| allocator.free(item);
+        input_history.deinit(allocator);
+    }
+    var history_index: ?usize = null;
+
     var history_buffer = TextView.Buffer{};
     defer history_buffer.deinit(allocator);
 
@@ -152,7 +159,27 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                 switch (mode) {
                     .input => {
                         if (focus != .input) break;
-                        if (key.matches(Key.enter, .{}) or key.matches(Key.kp_enter, .{})) {
+                        if (key.matches(Key.up, .{})) {
+                            if (input_history.items.len > 0) {
+                                if (history_index == null) {
+                                    history_index = input_history.items.len - 1;
+                                } else if (history_index.? > 0) {
+                                    history_index = history_index.? - 1;
+                                }
+                                const idx = history_index.?;
+                                try setInputText(&input, input_history.items[idx]);
+                            }
+                        } else if (key.matches(Key.down, .{})) {
+                            if (history_index) |idx| {
+                                if (idx + 1 < input_history.items.len) {
+                                    history_index = idx + 1;
+                                    try setInputText(&input, input_history.items[history_index.?]);
+                                } else {
+                                    history_index = null;
+                                    input.buf.clearRetainingCapacity();
+                                }
+                            }
+                        } else if (key.matches(Key.enter, .{}) or key.matches(Key.kp_enter, .{})) {
                             if (input.buf.realLength() == 0) {
                                 show_empty_warning = true;
                             } else {
@@ -162,6 +189,9 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                                     return error.UsageError;
                                 };
                                 defer allocator.free(prompt);
+
+                                try input_history.append(allocator, try allocator.dupe(u8, prompt));
+                                history_index = null;
 
                                 input.buf.clearRetainingCapacity();
                                 output.clearRetainingCapacity();
@@ -403,6 +433,12 @@ fn appendStyled(allocator: std.mem.Allocator, buffer: *TextView.Buffer, style: v
     try buffer.append(allocator, .{ .bytes = text });
     const end = buffer.content.items.len;
     try buffer.updateStyle(allocator, .{ .begin = start, .end = end, .style = style });
+}
+
+fn setInputText(input: *TextInput, text: []const u8) !void {
+    input.buf.clearRetainingCapacity();
+    if (text.len == 0) return;
+    try input.insertSliceAtCursor(text);
 }
 
 fn logSinkWrite(ctx: *anyopaque, msg: []const u8) void {
