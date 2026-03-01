@@ -72,6 +72,9 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
     };
     defer tty.deinit();
 
+    const crash_log = std.fs.cwd().createFile("/tmp/claude_tui_crash.log", .{ .truncate = true }) catch null;
+    defer if (crash_log) |file| file.close();
+
     var vx = try vaxis.init(allocator, .{});
     defer vx.deinit(allocator, tty.writer());
 
@@ -135,6 +138,9 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                 vx.queueRefresh();
             },
             .key_press => |key| {
+                if (crash_log) |*file| {
+                    _ = file.write("key\n") catch {};
+                }
                 if (mode == .running) {
                     if (key.matches('c', .{ .ctrl = true })) {
                         diag.setBorrowed(.usage, "Prompt cancelled");
@@ -198,6 +204,12 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                         output.clearRetainingCapacity();
                         const msg = Errors.userFacingMessage(allocator, err, diag) catch "Unexpected runtime error";
                         defer allocator.free(msg);
+                        if (crash_log) |*file| {
+                            _ = file.write("runWithPrompt error\n") catch {};
+                            _ = file.write("details:\n") catch {};
+                            _ = file.write(msg) catch {};
+                            _ = file.write("\n") catch {};
+                        }
                         try appendMessage(allocator, &messages, .system, msg);
                         try output.appendSlice(allocator, msg);
                     };
