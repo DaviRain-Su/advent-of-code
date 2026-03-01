@@ -38,6 +38,7 @@ const Theme = struct {
     assistant: vaxis.Style = .{ .fg = .{ .index = 4 }, .bg = .{ .index = 0 } },
     system: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 0 } },
     input_prompt: vaxis.Style = .{ .fg = .{ .index = 3 }, .bg = .{ .index = 0 }, .bold = true },
+    input_text: vaxis.Style = .{ .fg = .{ .index = 15 }, .bg = .{ .index = 0 } },
 };
 
 fn resolveModelLabel() []const u8 {
@@ -235,7 +236,7 @@ fn render(
     theme: Theme,
 ) !void {
     const win = vx.window();
-    win.clear();
+    win.fill(.{ .style = theme.bg });
 
     const height = win.height;
     const width = win.width;
@@ -312,7 +313,7 @@ fn render(
     if (input_buffer.items.len > 0) {
         const max_width: usize = if (width > 2) @as(usize, width) - 2 else 0;
         const display = tailSliceByDisplayWidth(input_buffer.items, max_width);
-        const input_seg = vaxis.Cell.Segment{ .text = display, .style = .{} };
+        const input_seg = vaxis.Cell.Segment{ .text = display, .style = theme.input_text };
         _ = win.printSegment(input_seg, .{ .row_offset = input_row, .col_offset = 2, .wrap = .none });
     }
 
