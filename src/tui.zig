@@ -1,5 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
+const builtin = @import("builtin");
 
 const App = @import("app.zig");
 const Agent = @import("agent.zig");
@@ -66,18 +67,28 @@ fn logCrash(file: *std.fs.File, comptime fmt: []const u8, args: anytype) void {
     _ = file.write("\n") catch {};
 }
 
+fn probeTTY() ?std.posix.E {
+    const path = "/dev/tty" ++ [_]u8{0};
+    const flags: std.posix.O = .{ .ACCMODE = .RDWR };
+
+    while (true) {
+        const fd = std.c.open(path, flags);
+        if (fd >= 0) {
+            std.posix.close(@intCast(fd));
+            return null;
+        }
+
+        const err = std.posix.errno(fd);
+        if (err == .INTR) continue;
+        return err;
+    }
+}
+
 pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
     if (!std.posix.isatty(std.posix.STDIN_FILENO)) {
         diag.setBorrowed(.usage, "TUI requires a TTY. Use -p for CLI mode.");
         return error.TuiUnavailable;
     }
-
-    var tty_buffer: [4096]u8 = undefined;
-    var tty = vaxis.Tty.init(tty_buffer[0..]) catch |err| {
-        diag.setf(.usage, "Failed to initialize TUI: {any}", .{err}) catch {};
-        return error.TuiUnavailable;
-    };
-    defer tty.deinit();
 
     const crash_log = std.fs.cwd().createFile("/tmp/claude_tui_crash.log", .{ .truncate = true }) catch null;
     defer if (crash_log) |file| file.close();
@@ -87,6 +98,28 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
             logCrash(&mutable, "tui error: {s}", .{@errorName(err)});
         }
     }
+
+    if (builtin.os.tag != .windows) {
+        if (probeTTY()) |err| {
+            if (crash_log) |file| {
+                var mutable = file;
+                logCrash(&mutable, "tui preflight failed open /dev/tty: {s}", .{@tagName(err)});
+            }
+            diag.setBorrowed(.usage, "TUI requires a controlling terminal (/dev/tty). Use -p for CLI mode.");
+            return error.TuiUnavailable;
+        }
+    }
+
+    var tty_buffer: [4096]u8 = undefined;
+    var tty = vaxis.Tty.init(tty_buffer[0..]) catch |err| {
+        if (crash_log) |file| {
+            var mutable = file;
+            logCrash(&mutable, "Failed to initialize TUI: {s}", .{@errorName(err)});
+        }
+        diag.setf(.usage, "Failed to initialize TUI: {any}", .{err}) catch {};
+        return error.TuiUnavailable;
+    };
+    defer tty.deinit();
 
     var vx = try vaxis.init(allocator, .{});
     defer vx.deinit(allocator, tty.writer());

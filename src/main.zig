@@ -6,6 +6,23 @@ const App = @import("app.zig");
 const Prompt = @import("prompt.zig");
 const Tui = @import("tui.zig");
 
+// Capture panic traces to a file so TUI crashes can be diagnosed even when
+// terminal output is disrupted.
+pub const panic = std.debug.FullPanic(struct {
+    fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
+        if (std.fs.cwd().createFile("/tmp/claude_tui_crash.log", .{}) catch null) |file| {
+            defer file.close();
+            var out_buf: [4096]u8 = undefined;
+            const msg_line = std.fmt.bufPrint(&out_buf, "[panic] {s}\n", .{msg}) catch "[panic] <format error>\n";
+            _ = file.write(msg_line) catch {};
+            _ = file.write("trace: ") catch {};
+            _ = file.write("(incomplete, see stderr)\n") catch {};
+        }
+
+        std.debug.defaultPanic(msg, first_trace_addr);
+    }
+}.panicFn);
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
