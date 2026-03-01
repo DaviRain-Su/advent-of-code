@@ -67,6 +67,6 @@ pub fn main() !void {
     std.debug.print("Logs from your program will appear here!\n", .{});
 
     // TODO: Uncomment the lines below to pass the first stage
-    // const content = choices.array.items[0].object.get("message").?.object.get("content").?.string;
-    // try std.fs.File.stdout().writeAll(content);
+    const content = choices.array.items[0].object.get("message").?.object.get("content").?.string;
+    try std.fs.File.stdout().writeAll(content);
 }
