@@ -17,7 +17,7 @@ pub fn buildRequestBody(allocator: std.mem.Allocator, cfg: Config, messages: []c
                 type: []const u8,
                 properties: struct {
                     file_path: struct { type: []const u8, description: []const u8 },
-                    content: struct { type: []const u8, description: []const u8 },
+                    content: ?struct { type: []const u8, description: []const u8 } = null,
                 },
                 required: []const []const u8,
             },
@@ -32,7 +32,7 @@ pub fn buildRequestBody(allocator: std.mem.Allocator, cfg: Config, messages: []c
                     .type = "object",
                     .properties = .{
                         .file_path = .{ .type = "string", .description = "The path to the file to read" },
-                        .content = .{ .type = "string", .description = "(unused for read tool)" },
+                        .content = null,
                     },
                     .required = &[_][]const u8{ConfigMod.Defaults.read_file_param},
                 },
