@@ -16,7 +16,7 @@ fn debugf(enabled: bool, comptime fmt: []const u8, args: anytype) !void {
     try std.fs.File.stderr().writeAll(msg);
 }
 
-pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: ConfigMod.Config, prompt: []const u8) !void {
+pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: ConfigMod.Config, prompt: []const u8, output: ?*std.ArrayList(u8)) !void {
     const debug_enabled = ConfigMod.isDebugEnabled();
     const max_tool_calls = ConfigMod.maxToolCallsPerIteration();
     const max_iterations = ConfigMod.maxAgentIterations();
@@ -115,7 +115,11 @@ pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: Config
                 diag.setBorrowed(.validation, "Assistant final response does not include content");
                 return error.MissingField;
             };
-            try Prompt.writeAll(diag, final_content);
+            if (output) |buffer| {
+                try buffer.appendSlice(allocator, final_content);
+            } else {
+                try Prompt.writeAll(diag, final_content);
+            }
             try debugf(debug_enabled, "iteration {d}: finished with final assistant content length {d}", .{ iterations, final_content.len });
             break;
         }

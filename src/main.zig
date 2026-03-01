@@ -23,16 +23,11 @@ pub fn main() !void {
 
     if (prompt_opt) |prompt| {
         defer allocator.free(prompt);
-        App.runWithPrompt(&diagnostics, prompt) catch |err| {
+        App.runWithPrompt(allocator, &diagnostics, prompt, null) catch |err| {
             reportError(allocator, &diagnostics, err);
         };
     } else {
-        const prompt = Tui.collectPrompt(allocator, &diagnostics) catch |err| {
-            reportError(allocator, &diagnostics, err);
-            return;
-        };
-        defer allocator.free(prompt);
-        App.runWithPrompt(&diagnostics, prompt) catch |err| {
+        Tui.run(allocator, &diagnostics) catch |err| {
             reportError(allocator, &diagnostics, err);
         };
     }

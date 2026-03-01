@@ -3,18 +3,13 @@ const std = @import("std");
 const ErrorReport = @import("errors.zig").ErrorReport;
 const ConfigMod = @import("config.zig");
 const Agent = @import("agent.zig");
-const Prompt = @import("prompt.zig");
 
-pub fn runWithPrompt(diag: *ErrorReport, prompt: []const u8) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
+pub fn runWithPrompt(allocator: std.mem.Allocator, diag: *ErrorReport, prompt: []const u8, output: ?*std.ArrayList(u8)) !void {
     const config = ConfigMod.loadConfig(diag) catch |err| {
         return err;
     };
 
-    try Agent.runAgent(allocator, diag, config, prompt);
+    try Agent.runAgent(allocator, diag, config, prompt, output);
 }
 
 pub fn run(diag: *ErrorReport) !void {
@@ -22,7 +17,7 @@ pub fn run(diag: *ErrorReport) !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const prompt = Prompt.parsePrompt(allocator, diag) catch |err| {
+    const prompt = @import("prompt.zig").parsePrompt(allocator, diag) catch |err| {
         switch (err) {
             error.UsageError => return err,
             else => {
@@ -33,9 +28,5 @@ pub fn run(diag: *ErrorReport) !void {
     };
     defer allocator.free(prompt);
 
-    const config = ConfigMod.loadConfig(diag) catch |err| {
-        return err;
-    };
-
-    try Agent.runAgent(allocator, diag, config, prompt);
+    try runWithPrompt(allocator, diag, prompt, null);
 }
