@@ -49,6 +49,7 @@ fn reportError(allocator: std.mem.Allocator, diagnostics: *ErrorReport, err: any
         error.TooLargeToolOutput,
         error.TooManyToolCalls,
         error.ToolExecutionFailed,
+        error.TuiUnavailable,
         error.UnsupportedFunction,
         error.NoChoices,
         error.RequestedFileNotFound,

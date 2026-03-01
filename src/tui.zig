@@ -11,8 +11,16 @@ const Event = union(enum) {
 };
 
 pub fn collectPrompt(allocator: std.mem.Allocator, diag: *ErrorReport) ![]const u8 {
+    if (!std.posix.isatty(std.posix.STDIN_FILENO)) {
+        diag.setBorrowed(.usage, "TUI requires a TTY. Use -p for CLI mode.");
+        return error.TuiUnavailable;
+    }
+
     var tty_buffer: [4096]u8 = undefined;
-    var tty = try vaxis.Tty.init(tty_buffer[0..]);
+    var tty = vaxis.Tty.init(tty_buffer[0..]) catch |err| {
+        diag.setf(.usage, "Failed to initialize TUI: {any}", .{err}) catch {};
+        return error.TuiUnavailable;
+    };
     defer tty.deinit();
 
     var vx = try vaxis.init(allocator, .{});
@@ -42,8 +50,9 @@ pub fn collectPrompt(allocator: std.mem.Allocator, diag: *ErrorReport) ![]const 
         }
     }
 
-    try render(&vx, tty.writer(), &input);
+    try render(&vx, tty.writer(), &input, false);
 
+    var show_empty_warning = false;
     while (true) {
         const event = loop.nextEvent();
         switch (event) {
@@ -54,20 +63,25 @@ pub fn collectPrompt(allocator: std.mem.Allocator, diag: *ErrorReport) ![]const 
             },
             .key_press => |key| {
                 if (key.matches(Key.enter, .{}) or key.matches(Key.kp_enter, .{})) {
-                    return input.buf.toOwnedSlice();
-                }
-                if (key.matches('c', .{ .ctrl = true })) {
+                    if (input.buf.realLength() == 0) {
+                        show_empty_warning = true;
+                    } else {
+                        return input.buf.toOwnedSlice();
+                    }
+                } else if (key.matches('c', .{ .ctrl = true })) {
                     diag.setBorrowed(.usage, "Prompt cancelled");
                     return error.UsageError;
+                } else {
+                    try input.update(.{ .key_press = key });
+                    show_empty_warning = false;
                 }
-                try input.update(.{ .key_press = key });
             },
         }
-        try render(&vx, tty.writer(), &input);
+        try render(&vx, tty.writer(), &input, show_empty_warning);
     }
 }
 
-fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, input: *TextInput) !void {
+fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, input: *TextInput, show_empty_warning: bool) !void {
     const win = vx.window();
     win.clear();
 
@@ -76,6 +90,11 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, input: *TextInput) !void
 
     const help = vaxis.Cell.Segment{ .text = "Enter prompt and press Enter. Ctrl+C to cancel." };
     _ = win.printSegment(help, .{ .row_offset = 1, .col_offset = 0, .wrap = .none });
+
+    if (show_empty_warning and win.height > 2) {
+        const warning = vaxis.Cell.Segment{ .text = "Prompt cannot be empty." };
+        _ = win.printSegment(warning, .{ .row_offset = 2, .col_offset = 0, .wrap = .none });
+    }
 
     if (win.height > 0) {
         const height: usize = win.height;
