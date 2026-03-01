@@ -30,14 +30,15 @@ const Message = struct {
 };
 
 const Theme = struct {
+    bg: vaxis.Style = .{ .fg = .default, .bg = .{ .index = 0 } },
     title_bar: vaxis.Style = .{ .fg = .{ .index = 0 }, .bg = .{ .index = 6 }, .bold = true },
     status_bar: vaxis.Style = .{ .fg = .{ .index = 15 }, .bg = .{ .index = 8 } },
-    separator: vaxis.Style = .{ .fg = .{ .index = 8 } },
-    user: vaxis.Style = .{ .fg = .{ .index = 2 }, .bold = true },
-    assistant: vaxis.Style = .{ .fg = .{ .index = 4 } },
-    system: vaxis.Style = .{ .fg = .{ .index = 8 } },
-    input_prompt: vaxis.Style = .{ .fg = .{ .index = 3 }, .bold = true },
-    input_text: vaxis.Style = .{},
+    separator: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 0 } },
+    user: vaxis.Style = .{ .fg = .{ .index = 2 }, .bg = .{ .index = 0 }, .bold = true },
+    assistant: vaxis.Style = .{ .fg = .{ .index = 4 }, .bg = .{ .index = 0 } },
+    system: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 0 } },
+    input_prompt: vaxis.Style = .{ .fg = .{ .index = 3 }, .bg = .{ .index = 0 }, .bold = true },
+    input_text: vaxis.Style = .{ .fg = .{ .index = 15 }, .bg = .{ .index = 0 } },
 };
 
 fn resolveModelLabel() []const u8 {
@@ -235,7 +236,7 @@ fn render(
     theme: Theme,
 ) !void {
     const win = vx.window();
-    win.clear();
+    win.fill(.{ .style = theme.bg });
 
     const height = win.height;
     const width = win.width;
