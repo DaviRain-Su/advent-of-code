@@ -10,9 +10,16 @@ const Defaults = struct {
     const default_base_url = "https://openrouter.ai/api/v1";
     const default_openai_model = "anthropic/claude-haiku-4.5";
     const default_deepseek_model = "deepseek-chat";
+
     const read_tool_name = "Read";
     const read_file_param = "file_path";
     const read_tool_description = "Read and return the contents of a file";
+};
+
+const AssistantAction = union(enum) {
+    read_file: []const u8,
+    reply_text: []const u8,
+    none,
 };
 
 fn parsePrompt(allocator: std.mem.Allocator) ![]const u8 {
@@ -41,7 +48,7 @@ fn loadConfig() Config {
     };
 }
 
-fn requireField(obj: std.json.ObjectMap, key: []const u8) std.json.Value {
+fn getField(obj: std.json.ObjectMap, key: []const u8) std.json.Value {
     return obj.get(key) orelse @panic("Expected field in response JSON");
 }
 
@@ -60,12 +67,42 @@ fn asObject(v: std.json.Value) std.json.ObjectMap {
     return v.object;
 }
 
+fn writeAllOrPanic(data: []const u8) void {
+    std.fs.File.stdout().writeAll(data) catch @panic("Failed to write output");
+}
+
+fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    return try file.readToEndAlloc(allocator, std.math.maxInt(usize));
+}
+
+fn readRequestedFile(allocator: std.mem.Allocator, requested_path: []const u8) ![]u8 {
+    // First try the path as provided by the model.
+    if (readFileAll(allocator, requested_path)) |contents| {
+        return contents;
+    } else |err| {
+        if (err != error.FileNotFound) return err;
+    }
+
+    // Keep backward-compatibility behavior for bare filenames (e.g. "main.zig").
+    const looksLikeBareName =
+        std.mem.indexOfScalar(u8, requested_path, '/') == null and
+        std.mem.indexOfScalar(u8, requested_path, '\\') == null;
+    if (!looksLikeBareName) return error.FileNotFound;
+
+    const src_path = try std.fmt.allocPrint(allocator, "src/{s}", .{requested_path});
+    defer allocator.free(src_path);
+
+    return readFileAll(allocator, src_path);
+}
+
 fn buildRequestBody(allocator: std.mem.Allocator, model: []const u8, prompt: []const u8) ![]u8 {
     var body_out: std.io.Writer.Allocating = .init(allocator);
     defer body_out.deinit();
 
-    var jw = std.json.Stringify{ .writer = &body_out.writer };
-    try jw.write(.{
+    var json_writer = std.json.Stringify{ .writer = &body_out.writer };
+    try json_writer.write(.{
         .model = model,
         .messages = &[_]struct { role: []const u8, content: []const u8 }{
             .{ .role = "user", .content = prompt },
@@ -140,31 +177,7 @@ fn throwOnApiError(response_obj: std.json.ObjectMap) void {
     }
 }
 
-fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-}
-
-fn readRequestedFile(allocator: std.mem.Allocator, requested_path: []const u8) ![]u8 {
-    if (readFileAll(allocator, requested_path)) |contents| {
-        return contents;
-    } else |err| {
-        if (err != error.FileNotFound) return err;
-    }
-
-    const is_relative_like =
-        std.mem.indexOfScalar(u8, requested_path, '/') == null and
-        std.mem.indexOfScalar(u8, requested_path, '\\') == null;
-    if (!is_relative_like) return error.FileNotFound;
-
-    const src_path = try std.fmt.allocPrint(allocator, "src/{s}", .{requested_path});
-    defer allocator.free(src_path);
-
-    return readFileAll(allocator, src_path);
-}
-
-fn extractReadToolFilePath(tool_calls: std.json.Value, allocator: std.mem.Allocator) ![]const u8 {
+fn parseReadToolPath(tool_calls: std.json.Value, allocator: std.mem.Allocator) ![]const u8 {
     const tool_call_list = asArray(tool_calls);
 
     if (tool_call_list.items.len == 0) {
@@ -172,48 +185,51 @@ fn extractReadToolFilePath(tool_calls: std.json.Value, allocator: std.mem.Alloca
     }
 
     const first_tool = asObject(tool_call_list.items[0]);
-    const function_obj = asObject(requireField(first_tool, "function"));
-    const fn_name = asString(requireField(function_obj, "name"));
+    const function_obj = asObject(getField(first_tool, "function"));
+    const function_name = asString(getField(function_obj, "name"));
 
-    if (!std.mem.eql(u8, fn_name, Defaults.read_tool_name)) {
+    if (!std.mem.eql(u8, function_name, Defaults.read_tool_name)) {
         @panic("Unsupported function");
     }
 
-    const args_raw = asString(requireField(function_obj, "arguments"));
+    const args_raw = asString(getField(function_obj, "arguments"));
     var parsed_args = try std.json.parseFromSlice(std.json.Value, allocator, args_raw, .{});
     defer parsed_args.deinit();
 
     const args_obj = asObject(parsed_args.value);
-    return asString(requireField(args_obj, Defaults.read_file_param));
+    return asString(getField(args_obj, Defaults.read_file_param));
 }
 
-fn maybeReadToolCall(allocator: std.mem.Allocator, message: std.json.ObjectMap) !bool {
-    const tool_calls = message.get("tool_calls") orelse return false;
-    if (tool_calls == .null) return false;
-    if (tool_calls != .array) @panic("tool_calls is not an array");
+fn parseAssistantAction(allocator: std.mem.Allocator, message: std.json.ObjectMap) !AssistantAction {
+    if (message.get("tool_calls")) |tool_calls| {
+        if (tool_calls == .null) return .none;
+        if (tool_calls != .array) @panic("tool_calls is not an array");
 
-    const file_path = try extractReadToolFilePath(tool_calls, allocator);
-
-    const file_contents = readRequestedFile(allocator, file_path) catch |err| {
-        if (err == error.FileNotFound) @panic("Failed to read requested file path");
-        return err;
-    };
-    defer allocator.free(file_contents);
-
-    try std.fs.File.stdout().writeAll(file_contents);
-    return true;
-}
-
-fn printTextContent(message: std.json.ObjectMap) void {
-    const content = requireField(message, "content");
-    if (content == .string) {
-        std.fs.File.stdout().writeAll(content.string) catch @panic("Failed to write output");
+        const file_path = try parseReadToolPath(tool_calls, allocator);
+        return .{ .read_file = file_path };
     }
+
+    const content = getField(message, "content");
+    if (content == .string) {
+        return .{ .reply_text = content.string };
+    }
+
+    return .none;
 }
 
-fn handleAssistantMessage(allocator: std.mem.Allocator, message: std.json.ObjectMap) !void {
-    if (try maybeReadToolCall(allocator, message)) return;
-    printTextContent(message);
+fn executeAssistantAction(allocator: std.mem.Allocator, action: AssistantAction) !void {
+    switch (action) {
+        .none => {},
+        .reply_text => |text| writeAllOrPanic(text),
+        .read_file => |path| {
+            const file_contents = readRequestedFile(allocator, path) catch |err| {
+                if (err == error.FileNotFound) @panic("Failed to read requested file path");
+                return err;
+            };
+            defer allocator.free(file_contents);
+            writeAllOrPanic(file_contents);
+        },
+    }
 }
 
 pub fn main() !void {
@@ -234,11 +250,12 @@ pub fn main() !void {
     const response_obj = asObject(parsed.value);
     throwOnApiError(response_obj);
 
-    const choices = asArray(requireField(response_obj, "choices"));
+    const choices = asArray(getField(response_obj, "choices"));
     if (choices.items.len == 0) @panic("No choices in response");
 
     const first_choice = asObject(choices.items[0]);
-    const message = asObject(requireField(first_choice, "message"));
+    const message = asObject(getField(first_choice, "message"));
 
-    try handleAssistantMessage(allocator, message);
+    const action = try parseAssistantAction(allocator, message);
+    try executeAssistantAction(allocator, action);
 }
