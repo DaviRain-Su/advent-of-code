@@ -23,7 +23,12 @@ pub fn render(
 
     const message_area_height: u16 = @intCast(height - 3);
     const max_content_width: usize = if (width > 2) @as(usize, width) - 2 else 0;
-    const total_lines = totalMessageLines(state.messages.items, max_content_width);
+    const running_output: ?[]const u8 = if (state.mode == .running and state.output.items.len > 0)
+        state.output.items
+    else
+        null;
+
+    const total_lines = totalMessageLinesWithOutput(state.messages.items, running_output, max_content_width);
     const max_display: usize = message_area_height;
     const lines_to_skip: usize = if (total_lines > max_display) total_lines - max_display else 0;
 
@@ -34,6 +39,7 @@ pub fn render(
         max_content_width,
         message_area_height,
         lines_to_skip,
+        running_output,
     );
 
     const sep_row: u16 = @intCast(height - 2);
@@ -47,6 +53,10 @@ pub fn render(
 }
 
 fn totalMessageLines(messages: []const Controller.Message, max_content_width: usize) usize {
+    return totalMessageLinesWithOutput(messages, null, max_content_width);
+}
+
+fn totalMessageLinesWithOutput(messages: []const Controller.Message, output: ?[]const u8, max_content_width: usize) usize {
     var total_lines: usize = 0;
     for (messages) |msg| {
         var iter = std.mem.splitScalar(u8, msg.content, '\n');
@@ -54,6 +64,14 @@ fn totalMessageLines(messages: []const Controller.Message, max_content_width: us
             total_lines += countWrappedLines(line, max_content_width);
         }
     }
+
+    if (output) |text| {
+        var output_iter = std.mem.splitScalar(u8, text, '\n');
+        while (output_iter.next()) |line| {
+            total_lines += countWrappedLines(line, max_content_width);
+        }
+    }
+
     return total_lines;
 }
 
@@ -64,6 +82,7 @@ fn renderMessages(
     max_content_width: usize,
     message_area_height: u16,
     lines_to_skip: usize,
+    running_output: ?[]const u8,
 ) void {
     var row: u16 = 1;
     var skipped: usize = 0;
@@ -77,6 +96,51 @@ fn renderMessages(
 
         var line_iter = std.mem.splitScalar(u8, msg.content, '\n');
         while (line_iter.next()) |line| {
+            var remaining = line;
+
+            if (remaining.len == 0) {
+                if (skipped < lines_to_skip) {
+                    skipped += 1;
+                    first_wrapped_line = false;
+                } else if (row < message_area_height + 1) {
+                    const prefix_text = if (first_wrapped_line) prefix else "  ";
+                    renderMessageLine(win, row, prefix_text, style, "");
+                    row += 1;
+                }
+                first_wrapped_line = false;
+                continue;
+            }
+
+            while (remaining.len > 0) {
+                const segment = if (displayWidth(remaining) > max_content_width)
+                    headSliceByDisplayWidth(remaining, max_content_width)
+                else
+                    remaining;
+
+                if (skipped < lines_to_skip) {
+                    skipped += 1;
+                } else if (row < message_area_height + 1) {
+                    const prefix_text = if (first_wrapped_line) prefix else "  ";
+                    renderMessageLine(win, row, prefix_text, style, segment);
+                    row += 1;
+                }
+
+                first_wrapped_line = false;
+
+                if (segment.len == remaining.len) break;
+                remaining = remaining[segment.len..];
+                if (segment.len == 0) break;
+            }
+        }
+    }
+
+    if (running_output) |text| {
+        const prefix = rolePrefix(.assistant);
+        const style = roleStyle(.assistant, theme);
+        var first_wrapped_line = true;
+
+        var iter = std.mem.splitScalar(u8, text, '\n');
+        while (iter.next()) |line| {
             var remaining = line;
 
             if (remaining.len == 0) {
