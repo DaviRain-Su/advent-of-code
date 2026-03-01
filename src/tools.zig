@@ -97,6 +97,10 @@ fn writeFileAll(path: []const u8, content: []const u8) !void {
         return error.TooLargeToolOutput;
     }
 
+    if (std.fs.path.dirname(path)) |dir_path| {
+        try std.fs.cwd().makePath(dir_path);
+    }
+
     const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
 
