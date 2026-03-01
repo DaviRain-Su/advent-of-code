@@ -20,6 +20,7 @@ pub fn main() !void {
             error.InvalidType,
             error.InvalidToolCallsShape,
             error.InvalidToolArguments,
+            error.TooLargeToolOutput,
             error.UnsupportedFunction,
             error.NoChoices,
             error.RequestedFileNotFound,

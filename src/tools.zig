@@ -2,7 +2,8 @@ const std = @import("std");
 const ErrorReport = @import("errors.zig").ErrorReport;
 const Models = @import("models.zig");
 const Json = @import("json_utils.zig").Json;
-const Defaults = @import("config.zig").Defaults;
+const ConfigMod = @import("config.zig");
+const Defaults = ConfigMod.Defaults;
 
 pub fn freeToolCallList(allocator: std.mem.Allocator, calls: []const Models.ToolCall) void {
     for (calls) |*call| {
@@ -51,6 +52,13 @@ fn isUnsafeToolPath(path: []const u8) bool {
 fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
+
+    const stat = try file.stat();
+    const max_bytes = ConfigMod.maxToolReadBytes();
+    if (stat.size > max_bytes) {
+        return error.TooLargeToolOutput;
+    }
+
     return try file.readToEndAlloc(allocator, std.math.maxInt(usize));
 }
 
@@ -62,6 +70,10 @@ pub fn readRequestedFile(allocator: std.mem.Allocator, diag: *ErrorReport, reque
 
     const attempted = readFileAll(allocator, requested_path) catch |err| switch (err) {
         error.FileNotFound => null,
+        error.TooLargeToolOutput => {
+            try diag.setf(.tool, "Tool read file '{s}' exceeds size limit", .{requested_path});
+            return error.TooLargeToolOutput;
+        },
         else => {
             try diag.setf(.filesystem, "Failed to open '{s}': {any}", .{ requested_path, err });
             return error.FileSystemError;
@@ -85,6 +97,10 @@ pub fn readRequestedFile(allocator: std.mem.Allocator, diag: *ErrorReport, reque
 
     const from_src = readFileAll(allocator, src_path) catch |err| switch (err) {
         error.FileNotFound => null,
+        error.TooLargeToolOutput => {
+            try diag.setf(.tool, "Tool read file '{s}' exceeds size limit", .{src_path});
+            return error.TooLargeToolOutput;
+        },
         else => {
             try diag.setf(.filesystem, "Failed to open '{s}': {any}", .{ src_path, err });
             return error.FileSystemError;
