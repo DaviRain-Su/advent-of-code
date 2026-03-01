@@ -281,7 +281,7 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
     }
 
     const content_start: usize = 0;
-    const content_height: usize = total_height - 1;
+    const content_height: usize = total_height - 2;
     const split_col: usize = total_width * 3 / 4;
 
     const history_panel = win.child(.{
@@ -289,10 +289,6 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
         .y_off = @intCast(content_start),
         .width = @intCast(split_col),
         .height = @intCast(content_height),
-        .border = .{
-            .where = .all,
-            .style = if (state.focus == .history) state.theme.focus_border else state.theme.border,
-        },
     });
 
     drawPanel(
@@ -304,14 +300,10 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
     );
 
     const log_panel = win.child(.{
-        .x_off = @intCast(split_col),
+        .x_off = @intCast(split_col + 1),
         .y_off = @intCast(content_start),
-        .width = @intCast(total_width - split_col),
+        .width = @intCast(total_width - split_col - 1),
         .height = @intCast(content_height),
-        .border = .{
-            .where = .all,
-            .style = if (state.focus == .logs) state.theme.focus_border else state.theme.border,
-        },
     });
 
     drawPanel(
@@ -321,6 +313,23 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
         "Logs",
         state.theme,
     );
+
+    if (split_col < total_width) {
+        const line_style = if (state.focus == .logs or state.focus == .history)
+            state.theme.focus_border
+        else
+            state.theme.border;
+        var row: usize = 0;
+        while (row < content_height) : (row += 1) {
+            win.writeCell(@intCast(split_col), @intCast(row), .{ .char = .{ .grapheme = "│", .width = 1 }, .style = line_style });
+        }
+    }
+
+    const separator_row: usize = total_height - 2;
+    var col: usize = 0;
+    while (col < total_width) : (col += 1) {
+        win.writeCell(@intCast(col), @intCast(separator_row), .{ .char = .{ .grapheme = "─", .width = 1 }, .style = state.theme.border });
+    }
 
     const input_row: usize = total_height - 1;
     const input_win = win.child(.{ .x_off = 0, .y_off = @intCast(input_row), .width = @intCast(total_width), .height = 1 });
@@ -342,30 +351,19 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
 }
 
 fn drawPanel(panel: vaxis.Window, view: *TextView, buffer: *TextView.Buffer, title: []const u8, theme: Theme) void {
-    if (panel.width <= 2 or panel.height <= 2) return;
+    if (panel.width == 0 or panel.height == 0) return;
 
     panel.fill(.{ .style = theme.bg });
 
-    const inner = panel.child(.{
-        .x_off = 1,
-        .y_off = 1,
-        .width = @intCast(panel.width - 2),
-        .height = @intCast(panel.height - 2),
-    });
-
-    inner.fill(.{ .style = theme.bg });
-
-    if (inner.height == 0) return;
-
     const title_segment = vaxis.Cell.Segment{ .text = title, .style = theme.title };
-    _ = inner.printSegment(title_segment, .{ .row_offset = 0, .col_offset = 0, .wrap = .none });
+    _ = panel.printSegment(title_segment, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
 
-    if (inner.height <= 1) return;
-    const content_win = inner.child(.{
+    if (panel.height <= 1) return;
+    const content_win = panel.child(.{
         .x_off = 0,
         .y_off = 1,
-        .width = @intCast(inner.width),
-        .height = @intCast(inner.height - 1),
+        .width = @intCast(panel.width),
+        .height = @intCast(panel.height - 1),
     });
 
     content_win.fill(.{ .style = theme.bg });
