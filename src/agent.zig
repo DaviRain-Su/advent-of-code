@@ -29,6 +29,21 @@ fn logSink(sink: ?LogSink, comptime fmt: []const u8, args: anytype) void {
     }
 }
 
+fn logSinkSnippet(sink: ?LogSink, label: []const u8, content: []const u8) void {
+    if (sink == null) return;
+    const max_len: usize = 200;
+    const truncated = content.len > max_len;
+    const slice = if (truncated) content[0..max_len] else content;
+
+    var scratch: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &scratch,
+        "{s}{s}{s}\n",
+        .{ label, slice, if (truncated) "..." else "" },
+    ) catch return;
+    sink.?.write(sink.?.ctx, msg);
+}
+
 pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: ConfigMod.Config, prompt: []const u8, output: ?*std.ArrayList(u8), log_sink: ?LogSink) !void {
     const debug_enabled = ConfigMod.isDebugEnabled();
     const max_tool_calls = ConfigMod.maxToolCallsPerIteration();
@@ -157,6 +172,7 @@ pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: Config
             };
 
             logSink(log_sink, "[tool] result bytes={d}\n", .{result.len});
+            logSinkSnippet(log_sink, "[tool] output: ", result);
             try debugf(
                 debug_enabled,
                 "iteration {d}: appended tool result #{d} for id={s}, bytes={d}",

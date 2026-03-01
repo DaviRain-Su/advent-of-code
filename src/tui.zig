@@ -42,6 +42,7 @@ const Theme = struct {
 const LogState = struct {
     allocator: std.mem.Allocator,
     buffer: *TextView.Buffer,
+    theme: Theme,
 };
 
 pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
@@ -121,9 +122,10 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
         .focus = focus,
         .show_empty_warning = show_empty_warning,
         .theme = theme,
+        .prompt_count = input_history.items.len,
     });
 
-    var log_state = LogState{ .allocator = allocator, .buffer = &log_buffer };
+    var log_state = LogState{ .allocator = allocator, .buffer = &log_buffer, .theme = theme };
     const sink = Agent.LogSink{ .ctx = &log_state, .write = logSinkWrite };
 
     while (true) {
@@ -212,6 +214,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                                     .focus = focus,
                                     .show_empty_warning = show_empty_warning,
                                     .theme = theme,
+                                    .prompt_count = input_history.items.len,
                                 });
 
                                 App.runWithPrompt(allocator, diag, prompt, &output, sink) catch |err| {
@@ -264,6 +267,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
             .focus = focus,
             .show_empty_warning = show_empty_warning,
             .theme = theme,
+            .prompt_count = input_history.items.len,
         });
     }
 }
@@ -278,6 +282,7 @@ const RenderState = struct {
     focus: FocusPanel,
     show_empty_warning: bool,
     theme: Theme,
+    prompt_count: usize,
 };
 
 fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !void {
@@ -302,9 +307,20 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
     const help_segment = vaxis.Cell.Segment{ .text = help_line, .style = state.theme.status };
     _ = win.printSegment(help_segment, .{ .row_offset = 1, .col_offset = 0, .wrap = .none });
 
-    if (state.show_empty_warning and win.height > 2) {
+    if (win.height > 2) {
+        var status_buf: [128]u8 = undefined;
+        const status_line = std.fmt.bufPrint(
+            &status_buf,
+            "Prompts: {d}  History rows: {d}  Log rows: {d}",
+            .{ state.prompt_count, state.history_buffer.rows, state.log_buffer.rows },
+        ) catch "";
+        const status_segment = vaxis.Cell.Segment{ .text = status_line, .style = state.theme.status };
+        _ = win.printSegment(status_segment, .{ .row_offset = 2, .col_offset = 0, .wrap = .none });
+    }
+
+    if (state.show_empty_warning and win.height > 3) {
         const warning = vaxis.Cell.Segment{ .text = "Prompt cannot be empty.", .style = state.theme.warning };
-        _ = win.printSegment(warning, .{ .row_offset = 2, .col_offset = 0, .wrap = .none });
+        _ = win.printSegment(warning, .{ .row_offset = 3, .col_offset = 0, .wrap = .none });
     }
 
     const total_height: usize = win.height;
@@ -314,8 +330,8 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
         return;
     }
 
-    const content_start: usize = 3;
-    const content_height: usize = total_height - 5;
+    const content_start: usize = 4;
+    const content_height: usize = total_height - 6;
     const history_height: usize = content_height * 2 / 3;
     _ = history_height;
     const split_col: usize = total_width * 2 / 3;
@@ -363,8 +379,13 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
     input_win.clear();
 
     if (state.mode == .input) {
-        state.input.draw(input_win);
-        input_win.showCursor(state.input.prev_cursor_col, 0);
+        const label = vaxis.Cell.Segment{ .text = "Input> ", .style = state.theme.status };
+        _ = input_win.printSegment(label, .{ .row_offset = 0, .col_offset = 0, .wrap = .none });
+        const label_len: u16 = 7;
+        const input_child = input_win.child(.{ .x_off = @intCast(label_len), .y_off = 0, .width = @intCast(@max(total_width - label_len, 1)), .height = 1 });
+        input_child.clear();
+        state.input.draw(input_child);
+        input_child.showCursor(state.input.prev_cursor_col, 0);
     } else {
         input_win.hideCursor();
     }
@@ -443,5 +464,18 @@ fn setInputText(input: *TextInput, text: []const u8) !void {
 
 fn logSinkWrite(ctx: *anyopaque, msg: []const u8) void {
     const state: *LogState = @ptrCast(@alignCast(ctx));
-    appendPlain(state.allocator, state.buffer, msg) catch {};
+    var it = std.mem.splitScalar(u8, msg, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const style = if (std.mem.startsWith(u8, line, "[tool]"))
+            state.theme.tool
+        else if (std.mem.startsWith(u8, line, "[assistant]"))
+            state.theme.assistant
+        else if (std.mem.startsWith(u8, line, "[agent]"))
+            state.theme.status
+        else
+            state.theme.status;
+        appendStyled(state.allocator, state.buffer, style, line) catch {};
+        appendPlain(state.allocator, state.buffer, "\n") catch {};
+    }
 }
