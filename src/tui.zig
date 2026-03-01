@@ -54,10 +54,57 @@ fn resolveModelLabel() []const u8 {
     return ConfigMod.Defaults.default_openai_model;
 }
 
-const LogState = struct {
+const TuiState = struct {
     allocator: std.mem.Allocator,
-    messages: *std.ArrayList(Message),
+    messages: std.ArrayList(Message),
     theme: Theme,
+    input_buffer: std.ArrayList(u8),
+    input_history: std.ArrayList([]const u8),
+    history_index: ?usize,
+    output: std.ArrayList(u8),
+    mode: UiMode,
+    crash_log: ?std.fs.File,
+
+    fn init(allocator: std.mem.Allocator, theme: Theme) TuiState {
+        return .{
+            .allocator = allocator,
+            .messages = std.ArrayList(Message){},
+            .theme = theme,
+            .input_buffer = std.ArrayList(u8){},
+            .input_history = std.ArrayList([]const u8){},
+            .history_index = null,
+            .output = std.ArrayList(u8){},
+            .mode = .input,
+            .crash_log = null,
+        };
+    }
+
+    fn deinit(self: *TuiState) void {
+        for (self.messages.items) |msg| {
+            self.allocator.free(msg.content);
+        }
+        self.messages.deinit(self.allocator);
+
+        self.input_buffer.deinit(self.allocator);
+
+        for (self.input_history.items) |item| {
+            self.allocator.free(item);
+        }
+        self.input_history.deinit(self.allocator);
+
+        self.output.deinit(self.allocator);
+
+        if (self.crash_log) |file| {
+            file.close();
+        }
+    }
+
+    fn log(self: *const TuiState, comptime fmt: []const u8, args: anytype) void {
+        if (self.crash_log) |file| {
+            var mutable = file;
+            logCrash(&mutable, fmt, args);
+        }
+    }
 };
 
 fn logCrash(file: *std.fs.File, comptime fmt: []const u8, args: anytype) void {
@@ -90,21 +137,17 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
         return error.TuiUnavailable;
     }
 
-    const crash_log = std.fs.cwd().createFile("/tmp/claude_tui_crash.log", .{ .truncate = true }) catch null;
-    defer if (crash_log) |file| file.close();
+    var state = TuiState.init(allocator, .{});
+    defer state.deinit();
+
+    state.crash_log = std.fs.cwd().createFile("/tmp/claude_tui_crash.log", .{ .truncate = true }) catch null;
     errdefer |err| {
-        if (crash_log) |file| {
-            var mutable = file;
-            logCrash(&mutable, "tui error: {s}", .{@errorName(err)});
-        }
+        state.log("tui error: {s}", .{@errorName(err)});
     }
 
     if (builtin.os.tag != .windows) {
         if (probeTTY()) |err| {
-            if (crash_log) |file| {
-                var mutable = file;
-                logCrash(&mutable, "tui preflight failed open /dev/tty: {s}", .{@tagName(err)});
-            }
+            state.log("tui preflight failed open /dev/tty: {s}", .{@tagName(err)});
             diag.setBorrowed(.usage, "TUI requires a controlling terminal (/dev/tty). Use -p for CLI mode.");
             return error.TuiUnavailable;
         }
@@ -112,10 +155,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
 
     var tty_buffer: [4096]u8 = undefined;
     var tty = vaxis.Tty.init(tty_buffer[0..]) catch |err| {
-        if (crash_log) |file| {
-            var mutable = file;
-            logCrash(&mutable, "Failed to initialize TUI: {s}", .{@errorName(err)});
-        }
+        state.log("Failed to initialize TUI: {s}", .{@errorName(err)});
         diag.setf(.usage, "Failed to initialize TUI: {any}", .{err}) catch {};
         return error.TuiUnavailable;
     };
@@ -132,28 +172,6 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
     defer loop.stop();
     try loop.start();
 
-    var input_buffer = std.ArrayList(u8){};
-    defer input_buffer.deinit(allocator);
-
-    var input_history = std.ArrayList([]const u8){};
-    defer {
-        for (input_history.items) |item| allocator.free(item);
-        input_history.deinit(allocator);
-    }
-    var history_index: ?usize = null;
-
-    var messages = std.ArrayList(Message){};
-    defer {
-        for (messages.items) |msg| allocator.free(msg.content);
-        messages.deinit(allocator);
-    }
-
-    var output = std.ArrayList(u8){};
-    defer output.deinit(allocator);
-
-    const theme: Theme = .{};
-    var mode: UiMode = .input;
-
     var winsize: ?vaxis.Winsize = null;
     while (winsize == null) {
         const event = loop.nextEvent();
@@ -167,13 +185,12 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
         }
     }
 
-    try appendMessage(allocator, &messages, .system, "Welcome to Claude Code TUI.");
-    try appendMessage(allocator, &messages, .system, "Ready.");
+    try appendMessage(allocator, &state.messages, .system, "Welcome to Claude Code TUI.");
+    try appendMessage(allocator, &state.messages, .system, "Ready.");
 
-    try render(&vx, tty.writer(), &messages, &input_buffer, mode, theme);
+    try render(&vx, tty.writer(), &state);
 
-    var log_state = LogState{ .allocator = allocator, .messages = &messages, .theme = theme };
-    const sink = Agent.LogSink{ .ctx = &log_state, .write = logSinkWrite };
+    const sink = Agent.LogSink{ .ctx = &state, .write = logSinkWrite };
 
     while (true) {
         const event = loop.nextEvent();
@@ -184,131 +201,142 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                 vx.queueRefresh();
             },
             .key_press => |key| {
-                if (mode == .running) {
-                    if (key.matches('c', .{ .ctrl = true })) {
-                        diag.setBorrowed(.usage, "Prompt cancelled");
-                        return error.UsageError;
-                    }
-                    // Ignore non-cancel keys while running.
-                }
-
-                if (mode != .running and key.matches(Key.up, .{})) {
-                    if (input_history.items.len > 0) {
-                        if (history_index == null) {
-                            history_index = input_history.items.len - 1;
-                        } else if (history_index.? > 0) {
-                            history_index = history_index.? - 1;
-                        }
-                        const idx = history_index.?;
-                        try setInputBuffer(allocator, &input_buffer, input_history.items[idx]);
-                    }
-                }
-                else if (mode != .running and key.matches(Key.down, .{})) {
-                    if (history_index) |idx| {
-                        if (idx + 1 < input_history.items.len) {
-                            history_index = idx + 1;
-                            try setInputBuffer(allocator, &input_buffer, input_history.items[history_index.?]);
-                        } else {
-                            history_index = null;
-                            input_buffer.clearRetainingCapacity();
-                        }
-                    }
-                }
-                else if (mode != .running and key.matches(Key.backspace, .{})) {
-                    _ = popUtf8Char(&input_buffer);
-                }
-                else if (mode != .running and (key.matches(Key.enter, .{}) or key.matches(Key.kp_enter, .{}))) {
-                    if (input_buffer.items.len == 0) {
-                        try appendMessage(allocator, &messages, .system, "Prompt cannot be empty.");
-                        // keep running in input mode and continue below to render.
-                    }
-                    else {
-                        const prompt = try allocator.dupe(u8, input_buffer.items);
-                        defer allocator.free(prompt);
-
-                        try input_history.append(allocator, try allocator.dupe(u8, prompt));
-                        history_index = null;
-
-                        input_buffer.clearRetainingCapacity();
-                        output.clearRetainingCapacity();
-                        mode = .running;
-
-                        try appendMessage(allocator, &messages, .user, prompt);
-                        try appendMessage(allocator, &messages, .system, "Running prompt...");
-                        render(&vx, tty.writer(), &messages, &input_buffer, mode, theme) catch |err| {
-                            if (crash_log) |file| {
-                                var mutable = file;
-                                logCrash(&mutable, "render before runWithPrompt failed: {s}", .{@errorName(err)});
-                            }
-                            diag.setf(.usage, "TUI render failed: {s}", .{@errorName(err)}) catch {};
-                            return error.TuiUnavailable;
-                        };
-
-                        if (crash_log) |file| {
-                            var mutable = file;
-                            logCrash(&mutable, "runWithPrompt start len={d}", .{prompt.len});
-                        }
-
-                        App.runWithPrompt(allocator, diag, prompt, &output, sink) catch |err| {
-                            output.clearRetainingCapacity();
-                            const msg = try allocator.dupe(u8, Errors.userFacingMessage(allocator, err, diag) catch "Unexpected runtime error");
-                            defer allocator.free(msg);
-                            if (crash_log) |file| {
-                                var mutable = file;
-                                logCrash(&mutable, "runWithPrompt error: {s}", .{@errorName(err)});
-                                logCrash(&mutable, "details: {s}", .{msg});
-                            }
-                            try appendMessage(allocator, &messages, .system, msg);
-                            try output.appendSlice(allocator, msg);
-                        };
-
-                        if (crash_log) |file| {
-                            var mutable = file;
-                            logCrash(&mutable, "runWithPrompt end len={d}", .{output.items.len});
-                        }
-
-                        if (output.items.len > 0) {
-                            try appendMessage(allocator, &messages, .assistant, output.items);
-                        }
-
-                        try appendMessage(allocator, &messages, .system, "Done.");
-                        mode = .input;
-                    }
-                }
-                else if (mode != .running and key.matches('c', .{ .ctrl = true })) {
-                    diag.setBorrowed(.usage, "Prompt cancelled");
+                const should_continue = try handleKeyEvent(allocator, &vx, tty.writer(), &state, key, sink, diag);
+                if (!should_continue) {
                     return error.UsageError;
-                }
-
-                else if (mode != .running) {
-                    if (key.text) |text| {
-                        try input_buffer.appendSlice(allocator, text);
-                    }
                 }
             },
         }
 
-        render(&vx, tty.writer(), &messages, &input_buffer, mode, theme) catch |err| {
-            if (crash_log) |file| {
-                var mutable = file;
-                logCrash(&mutable, "render loop failed: {s}", .{@errorName(err)});
-            }
+        render(&vx, tty.writer(), &state) catch |err| {
+            state.log("render loop failed: {s}", .{@errorName(err)});
             diag.setf(.usage, "TUI render failed: {s}", .{@errorName(err)}) catch {};
             return error.TuiUnavailable;
         };
     }
 }
 
+fn handleKeyEvent(
+    allocator: std.mem.Allocator,
+    vx: *vaxis.Vaxis,
+    writer: *std.Io.Writer,
+    state: *TuiState,
+    key: Key,
+    sink: Agent.LogSink,
+    diag: *ErrorReport,
+) !bool {
+    if (state.mode == .running) {
+        if (key.matches('c', .{ .ctrl = true })) {
+            diag.setBorrowed(.usage, "Prompt cancelled");
+            return false;
+        }
+        return true;
+    }
+
+    if (key.matches(Key.up, .{})) {
+        try navigateHistoryUp(allocator, state);
+    } else if (key.matches(Key.down, .{})) {
+        try navigateHistoryDown(allocator, state);
+    } else if (key.matches(Key.backspace, .{})) {
+        _ = popUtf8Char(&state.input_buffer);
+    } else if (key.matches(Key.enter, .{}) or key.matches(Key.kp_enter, .{})) {
+        try submitPrompt(allocator, vx, writer, state, diag, sink);
+    } else if (key.matches('c', .{ .ctrl = true })) {
+        diag.setBorrowed(.usage, "Prompt cancelled");
+        return false;
+    } else if (key.text) |text| {
+        try state.input_buffer.appendSlice(allocator, text);
+    }
+
+    return true;
+}
+
+fn navigateHistoryUp(allocator: std.mem.Allocator, state: *TuiState) !void {
+    if (state.input_history.items.len == 0) return;
+
+    if (state.history_index == null) {
+        state.history_index = state.input_history.items.len - 1;
+    } else if (state.history_index.? > 0) {
+        state.history_index = state.history_index.? - 1;
+    }
+
+    const idx = state.history_index.?;
+    try setInputBuffer(allocator, &state.input_buffer, state.input_history.items[idx]);
+}
+
+fn navigateHistoryDown(allocator: std.mem.Allocator, state: *TuiState) !void {
+    if (state.history_index) |idx| {
+        if (idx + 1 < state.input_history.items.len) {
+            state.history_index = idx + 1;
+            try setInputBuffer(allocator, &state.input_buffer, state.input_history.items[state.history_index.?]);
+        } else {
+            state.history_index = null;
+            state.input_buffer.clearRetainingCapacity();
+        }
+    }
+}
+
+fn submitPrompt(
+    allocator: std.mem.Allocator,
+    vx: *vaxis.Vaxis,
+    writer: *std.Io.Writer,
+    state: *TuiState,
+    diag: *ErrorReport,
+    sink: Agent.LogSink,
+) !void {
+    if (state.input_buffer.items.len == 0) {
+        try appendMessage(allocator, &state.messages, .system, "Prompt cannot be empty.");
+        return;
+    }
+
+    const prompt = try allocator.dupe(u8, state.input_buffer.items);
+    defer allocator.free(prompt);
+
+    try state.input_history.append(allocator, try allocator.dupe(u8, prompt));
+    state.history_index = null;
+
+    state.input_buffer.clearRetainingCapacity();
+    state.output.clearRetainingCapacity();
+    state.mode = .running;
+
+    try appendMessage(allocator, &state.messages, .user, prompt);
+    try appendMessage(allocator, &state.messages, .system, "Running prompt...");
+
+    render(&vx, writer, state) catch |err| {
+        state.log("render before runWithPrompt failed: {s}", .{@errorName(err)});
+        diag.setf(.usage, "TUI render failed: {s}", .{@errorName(err)}) catch {};
+        return error.TuiUnavailable;
+    };
+
+    state.log("runWithPrompt start len={d}", .{prompt.len});
+
+    App.runWithPrompt(allocator, diag, prompt, &state.output, sink) catch |err| {
+        state.output.clearRetainingCapacity();
+        const msg = try allocator.dupe(u8, Errors.userFacingMessage(allocator, err, diag) catch "Unexpected runtime error");
+        defer allocator.free(msg);
+        state.log("runWithPrompt error: {s}", .{@errorName(err)});
+        state.log("details: {s}", .{msg});
+        try appendMessage(allocator, &state.messages, .system, msg);
+        try state.output.appendSlice(allocator, msg);
+    };
+
+    state.log("runWithPrompt end len={d}", .{state.output.items.len});
+
+    if (state.output.items.len > 0) {
+        try appendMessage(allocator, &state.messages, .assistant, state.output.items);
+    }
+
+    try appendMessage(allocator, &state.messages, .system, "Done.");
+    state.mode = .input;
+}
+
 fn render(
     vx: *vaxis.Vaxis,
     writer: *std.Io.Writer,
-    messages: *std.ArrayList(Message),
-    input_buffer: *std.ArrayList(u8),
-    mode: UiMode,
-    theme: Theme,
+    state: *const TuiState,
 ) !void {
     const win = vx.window();
-    win.fill(.{ .style = theme.bg });
+    win.fill(.{ .style = state.theme.bg });
 
     const height = win.height;
     const width = win.width;
@@ -318,40 +346,62 @@ fn render(
         return;
     }
 
-    drawTitleBar(win, width, theme);
+    drawTitleBar(win, width, state.theme);
 
     const message_area_height: u16 = @intCast(height - 3);
     const max_content_width: usize = if (width > 2) @as(usize, width) - 2 else 0;
+    const total_lines = totalMessageLines(state.messages.items, max_content_width);
+    const max_display: usize = message_area_height;
+    const lines_to_skip: usize = if (total_lines > max_display) total_lines - max_display else 0;
 
+    renderMessages(
+        win,
+        state.messages.items,
+        state.theme,
+        max_content_width,
+        message_area_height,
+        lines_to_skip,
+    );
+
+    const sep_row: u16 = @intCast(height - 2);
+    drawSeparator(win, width, sep_row, state.theme);
+
+    const input_row: u16 = @intCast(height - 1);
+    renderInputRow(win, width, input_row, state);
+
+    try vx.render(writer);
+    try writer.flush();
+}
+
+fn totalMessageLines(messages: []const Message, max_content_width: usize) usize {
     var total_lines: usize = 0;
-    for (messages.items) |msg| {
+    for (messages) |msg| {
         var iter = std.mem.splitScalar(u8, msg.content, '\n');
         while (iter.next()) |line| {
             total_lines += countWrappedLines(line, max_content_width);
         }
     }
+    return total_lines;
+}
 
-    const max_display: usize = message_area_height;
-    const lines_to_skip: usize = if (total_lines > max_display) total_lines - max_display else 0;
-
+fn renderMessages(
+    win: vaxis.Window,
+    messages: []const Message,
+    theme: Theme,
+    max_content_width: usize,
+    message_area_height: u16,
+    lines_to_skip: usize,
+) void {
     var row: u16 = 1;
     var skipped: usize = 0;
 
-    for (messages.items) |msg| {
+    for (messages) |msg| {
         if (row >= message_area_height + 1) break;
 
-        const prefix = switch (msg.role) {
-            .user => "> ",
-            .assistant => "< ",
-            .system => "  ",
-        };
-        const style = switch (msg.role) {
-            .user => theme.user,
-            .assistant => theme.assistant,
-            .system => theme.system,
-        };
-
+        const prefix = rolePrefix(msg.role);
+        const style = roleStyle(msg.role, theme);
         var first_wrapped_line = true;
+
         var line_iter = std.mem.splitScalar(u8, msg.content, '\n');
         while (line_iter.next()) |line| {
             var remaining = line;
@@ -362,8 +412,7 @@ fn render(
                     first_wrapped_line = false;
                 } else if (row < message_area_height + 1) {
                     const prefix_text = if (first_wrapped_line) prefix else "  ";
-                    const prefix_seg = vaxis.Segment{ .text = prefix_text, .style = style };
-                    _ = win.print(&.{prefix_seg}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
+                    renderMessageLine(win, row, prefix_text, style, "");
                     row += 1;
                 }
                 first_wrapped_line = false;
@@ -380,11 +429,7 @@ fn render(
                     skipped += 1;
                 } else if (row < message_area_height + 1) {
                     const prefix_text = if (first_wrapped_line) prefix else "  ";
-                    const prefix_seg = vaxis.Segment{ .text = prefix_text, .style = style };
-                    _ = win.print(&.{prefix_seg}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
-
-                    const content_seg = vaxis.Segment{ .text = segment, .style = style };
-                    _ = win.print(&.{content_seg}, .{ .row_offset = row, .col_offset = 2, .wrap = .none });
+                    renderMessageLine(win, row, prefix_text, style, segment);
                     row += 1;
                 }
 
@@ -396,29 +441,58 @@ fn render(
             }
         }
     }
+}
 
-    const sep_row: u16 = @intCast(height - 2);
-    drawSeparator(win, width, sep_row, theme);
+fn renderMessageLine(
+    win: vaxis.Window,
+    row: u16,
+    prefix: []const u8,
+    style: vaxis.Style,
+    content: []const u8,
+) void {
+    const prefix_seg = vaxis.Segment{ .text = prefix, .style = style };
+    _ = win.print(&.{prefix_seg}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
 
-    const input_row: u16 = @intCast(height - 1);
-    const input_prefix = vaxis.Segment{ .text = "> ", .style = theme.input_prompt };
+    if (content.len == 0) return;
+    const content_seg = vaxis.Segment{ .text = content, .style = style };
+    _ = win.print(&.{content_seg}, .{ .row_offset = row, .col_offset = 2, .wrap = .none });
+}
+
+fn renderInputRow(
+    win: vaxis.Window,
+    width: u16,
+    input_row: u16,
+    state: *const TuiState,
+) void {
+    const input_prefix = vaxis.Segment{ .text = "> ", .style = state.theme.input_prompt };
     _ = win.print(&.{input_prefix}, .{ .row_offset = input_row, .col_offset = 0, .wrap = .none });
 
-    if (input_buffer.items.len > 0) {
+    if (state.input_buffer.items.len > 0) {
         const max_width: usize = if (width > 2) @as(usize, width) - 2 else 0;
-        const display = tailSliceByDisplayWidth(input_buffer.items, max_width);
-        const input_seg = vaxis.Segment{ .text = display, .style = theme.input_text };
+        const display = tailSliceByDisplayWidth(state.input_buffer.items, max_width);
+        const input_seg = vaxis.Segment{ .text = display, .style = state.theme.input_text };
         _ = win.print(&.{input_seg}, .{ .row_offset = input_row, .col_offset = 2, .wrap = .none });
     }
 
-    const display_len = displayWidth(input_buffer.items);
+    const display_len = displayWidth(state.input_buffer.items);
     const cursor_col: u16 = @intCast(@min(display_len + 2, width - 1));
     win.showCursor(cursor_col, input_row);
+}
 
-    _ = mode;
+fn rolePrefix(role: Role) []const u8 {
+    return switch (role) {
+        .user => "> ",
+        .assistant => "< ",
+        .system => "  ",
+    };
+}
 
-    try vx.render(writer);
-    try writer.flush();
+fn roleStyle(role: Role, theme: Theme) vaxis.Style {
+    return switch (role) {
+        .user => theme.user,
+        .assistant => theme.assistant,
+        .system => theme.system,
+    };
 }
 
 fn drawTitleBar(win: vaxis.Window, width: u16, theme: Theme) void {
@@ -541,7 +615,7 @@ fn headSliceByDisplayWidth(bytes: []const u8, max_width: usize) []const u8 {
 }
 
 fn logSinkWrite(ctx: *anyopaque, msg: []const u8) void {
-    const state: *LogState = @ptrCast(@alignCast(ctx));
+    const state: *TuiState = @ptrCast(@alignCast(ctx));
     var it = std.mem.splitScalar(u8, msg, '\n');
     while (it.next()) |line| {
         if (line.len == 0) continue;
