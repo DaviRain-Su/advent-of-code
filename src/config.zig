@@ -18,6 +18,7 @@ pub const Defaults = struct {
     pub const read_tool_description = "Read and return the contents of a file";
     pub const max_agent_iterations: u8 = 16;
     pub const max_tool_read_bytes: usize = 1024 * 1024;
+    pub const max_tool_calls_per_iteration: usize = 8;
 };
 
 /// Maximum bytes returned by tool file reads.
@@ -25,6 +26,29 @@ pub fn maxToolReadBytes() usize {
     const raw = std.posix.getenv("CLAUDE_TOOL_MAX_BYTES") orelse return Defaults.max_tool_read_bytes;
     const parsed = std.fmt.parseInt(usize, raw, 10) catch return Defaults.max_tool_read_bytes;
     return if (parsed == 0) Defaults.max_tool_read_bytes else parsed;
+}
+
+/// Maximum number of tool calls allowed per assistant message.
+pub fn maxToolCallsPerIteration() usize {
+    const raw = std.posix.getenv("CLAUDE_AGENT_MAX_TOOL_CALLS") orelse return Defaults.max_tool_calls_per_iteration;
+    const parsed = std.fmt.parseInt(usize, raw, 10) catch return Defaults.max_tool_calls_per_iteration;
+    if (parsed == 0) return Defaults.max_tool_calls_per_iteration;
+    return parsed;
+}
+
+/// Enable verbose diagnostics for request/response lifecycle tracing.
+pub fn isDebugEnabled() bool {
+    const raw = std.posix.getenv("CLAUDE_AGENT_DEBUG") orelse return false;
+    if (raw.len == 0) return false;
+
+    return std.mem.eql(u8, raw, "1") or
+        std.mem.eql(u8, raw, "true") or
+        std.mem.eql(u8, raw, "TRUE") or
+        std.mem.eql(u8, raw, "True") or
+        std.mem.eql(u8, raw, "yes") or
+        std.mem.eql(u8, raw, "YES") or
+        std.mem.eql(u8, raw, "on") or
+        std.mem.eql(u8, raw, "ON");
 }
 
 pub fn loadConfig(diag: *ErrorReport) !Config {
