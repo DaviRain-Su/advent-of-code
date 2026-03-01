@@ -16,7 +16,20 @@ fn debugf(enabled: bool, comptime fmt: []const u8, args: anytype) !void {
     try std.fs.File.stderr().writeAll(msg);
 }
 
-pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: ConfigMod.Config, prompt: []const u8, output: ?*std.ArrayList(u8)) !void {
+pub const LogSink = struct {
+    ctx: *anyopaque,
+    write: *const fn (ctx: *anyopaque, msg: []const u8) void,
+};
+
+fn logSink(sink: ?LogSink, comptime fmt: []const u8, args: anytype) void {
+    if (sink) |s| {
+        var scratch: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&scratch, fmt, args) catch return;
+        s.write(s.ctx, msg);
+    }
+}
+
+pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: ConfigMod.Config, prompt: []const u8, output: ?*std.ArrayList(u8), log_sink: ?LogSink) !void {
     const debug_enabled = ConfigMod.isDebugEnabled();
     const max_tool_calls = ConfigMod.maxToolCallsPerIteration();
     const max_iterations = ConfigMod.maxAgentIterations();
@@ -36,6 +49,7 @@ pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: Config
         "start agent run: max_iterations={d} max_tool_calls_per_step={d} prompt_len={d}",
         .{ max_iterations, max_tool_calls, prompt.len },
     );
+    logSink(log_sink, "[agent] start prompt (len={d})\n", .{prompt.len});
 
     var iterations: u8 = 0;
     while (iterations < max_iterations) : (iterations += 1) {
@@ -120,6 +134,7 @@ pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: Config
             } else {
                 try Prompt.writeAll(diag, final_content);
             }
+            logSink(log_sink, "[assistant] {s}\n", .{final_content});
             try debugf(debug_enabled, "iteration {d}: finished with final assistant content length {d}", .{ iterations, final_content.len });
             break;
         }
@@ -128,6 +143,7 @@ pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: Config
         try debugf(debug_enabled, "iteration {d}: assistant requested {d} tool calls", .{ iterations, tool_calls.len });
 
         for (tool_calls, 0..) |call, call_index| {
+            logSink(log_sink, "[tool] {s} id={s}\n", .{ call.function.name, call.id });
             const result = try Tools.executeToolCall(allocator, diag, call_index + 1, call);
             const tool_msg = Models.Message{
                 .role = "tool",
@@ -140,6 +156,7 @@ pub fn runAgent(allocator: std.mem.Allocator, diag: *ErrorReport, config: Config
                 return err;
             };
 
+            logSink(log_sink, "[tool] result bytes={d}\n", .{result.len});
             try debugf(
                 debug_enabled,
                 "iteration {d}: appended tool result #{d} for id={s}, bytes={d}",

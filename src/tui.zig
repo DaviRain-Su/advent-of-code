@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 
 const App = @import("app.zig");
+const Agent = @import("agent.zig");
 const Errors = @import("errors.zig");
 const ErrorReport = Errors.ErrorReport;
 const Key = vaxis.Key;
@@ -31,6 +32,15 @@ const Theme = struct {
     warning: vaxis.Style = .{ .fg = .{ .index = 11 }, .bg = .{ .index = 0 }, .bold = true },
     border: vaxis.Style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 0 } },
     focus_border: vaxis.Style = .{ .fg = .{ .index = 12 }, .bg = .{ .index = 0 }, .bold = true },
+    user: vaxis.Style = .{ .fg = .{ .index = 11 }, .bg = .{ .index = 0 }, .bold = true },
+    assistant: vaxis.Style = .{ .fg = .{ .index = 10 }, .bg = .{ .index = 0 } },
+    tool: vaxis.Style = .{ .fg = .{ .index = 14 }, .bg = .{ .index = 0 } },
+    error_style: vaxis.Style = .{ .fg = .{ .index = 9 }, .bg = .{ .index = 0 }, .bold = true },
+};
+
+const LogState = struct {
+    allocator: std.mem.Allocator,
+    buffer: *TextView.Buffer,
 };
 
 pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
@@ -72,6 +82,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
     var output = std.ArrayList(u8){};
     defer output.deinit(allocator);
 
+    const theme: Theme = .{};
     var mode: UiMode = .input;
     var focus: FocusPanel = .history;
     var show_empty_warning = false;
@@ -89,8 +100,8 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
         }
     }
 
-    try appendToBuffer(allocator, &history_buffer, "Welcome to Claude Code TUI.\n");
-    try appendToBuffer(allocator, &log_buffer, "Ready.\n");
+    try appendPlain(allocator, &history_buffer, "Welcome to Claude Code TUI.\n");
+    try appendPlain(allocator, &log_buffer, "Ready.\n");
 
     try render(&vx, tty.writer(), .{
         .input = &input,
@@ -101,8 +112,11 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
         .mode = mode,
         .focus = focus,
         .show_empty_warning = show_empty_warning,
-        .theme = .{},
+        .theme = theme,
     });
+
+    var log_state = LogState{ .allocator = allocator, .buffer = &log_buffer };
+    const sink = Agent.LogSink{ .ctx = &log_state, .write = logSinkWrite };
 
     while (true) {
         const event = loop.nextEvent();
@@ -139,10 +153,10 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                                 output.clearRetainingCapacity();
                                 mode = .running;
 
-                                try appendToBuffer(allocator, &history_buffer, "\nUser: ");
-                                try appendToBuffer(allocator, &history_buffer, prompt);
-                                try appendToBuffer(allocator, &history_buffer, "\n");
-                                try appendToBuffer(allocator, &log_buffer, "Running prompt...\n");
+                                try appendStyled(allocator, &history_buffer, theme.user, "User: ");
+                                try appendPlain(allocator, &history_buffer, prompt);
+                                try appendPlain(allocator, &history_buffer, "\n");
+                                try appendPlain(allocator, &log_buffer, "Running prompt...\n");
 
                                 try render(&vx, tty.writer(), .{
                                     .input = &input,
@@ -153,26 +167,26 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
                                     .mode = mode,
                                     .focus = focus,
                                     .show_empty_warning = show_empty_warning,
-                                    .theme = .{},
+                                    .theme = theme,
                                 });
 
-                                App.runWithPrompt(allocator, diag, prompt, &output) catch |err| {
+                                App.runWithPrompt(allocator, diag, prompt, &output, sink) catch |err| {
                                     output.clearRetainingCapacity();
                                     const msg = Errors.userFacingMessage(allocator, err, diag) catch "Unexpected runtime error";
                                     defer allocator.free(msg);
-                                    try appendToBuffer(allocator, &log_buffer, "Error: ");
-                                    try appendToBuffer(allocator, &log_buffer, msg);
-                                    try appendToBuffer(allocator, &log_buffer, "\n");
+                                    try appendStyled(allocator, &log_buffer, theme.error_style, "Error: ");
+                                    try appendPlain(allocator, &log_buffer, msg);
+                                    try appendPlain(allocator, &log_buffer, "\n");
                                     try output.appendSlice(allocator, msg);
                                 };
 
                                 if (output.items.len > 0) {
-                                    try appendToBuffer(allocator, &history_buffer, "Assistant: ");
-                                    try appendToBuffer(allocator, &history_buffer, output.items);
-                                    try appendToBuffer(allocator, &history_buffer, "\n");
+                                    try appendStyled(allocator, &history_buffer, theme.assistant, "Assistant: ");
+                                    try appendPlain(allocator, &history_buffer, output.items);
+                                    try appendPlain(allocator, &history_buffer, "\n");
                                 }
 
-                                try appendToBuffer(allocator, &log_buffer, "Done.\n");
+                                try appendPlain(allocator, &log_buffer, "Done.\n");
                                 mode = .done;
                             }
                         } else if (key.matches('c', .{ .ctrl = true })) {
@@ -205,7 +219,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
             .mode = mode,
             .focus = focus,
             .show_empty_warning = show_empty_warning,
-            .theme = .{},
+            .theme = theme,
         });
     }
 }
@@ -252,13 +266,14 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
     const content_start: usize = 3;
     const content_height: usize = total_height - 5;
     const history_height: usize = content_height * 2 / 3;
-    const log_height: usize = content_height - history_height;
+    _ = history_height;
+    const split_col: usize = total_width * 2 / 3;
 
     const history_panel = win.child(.{
         .x_off = 0,
         .y_off = @intCast(content_start),
-        .width = @intCast(total_width),
-        .height = @intCast(history_height),
+        .width = @intCast(split_col),
+        .height = @intCast(content_height),
         .border = .{
             .where = .all,
             .style = if (state.focus == .history) state.theme.focus_border else state.theme.border,
@@ -274,10 +289,10 @@ fn render(vx: *vaxis.Vaxis, tty_writer: *std.Io.Writer, state: RenderState) !voi
     );
 
     const log_panel = win.child(.{
-        .x_off = 0,
-        .y_off = @intCast(content_start + history_height),
-        .width = @intCast(total_width),
-        .height = @intCast(log_height),
+        .x_off = @intCast(split_col),
+        .y_off = @intCast(content_start),
+        .width = @intCast(total_width - split_col),
+        .height = @intCast(content_height),
         .border = .{
             .where = .all,
             .style = if (state.focus == .logs) state.theme.focus_border else state.theme.border,
@@ -352,6 +367,18 @@ fn handleScrollKey(key: Key, focus: FocusPanel, history_view: *TextView, log_vie
     return false;
 }
 
-fn appendToBuffer(allocator: std.mem.Allocator, buffer: *TextView.Buffer, text: []const u8) !void {
+fn appendPlain(allocator: std.mem.Allocator, buffer: *TextView.Buffer, text: []const u8) !void {
     try buffer.append(allocator, .{ .bytes = text });
+}
+
+fn appendStyled(allocator: std.mem.Allocator, buffer: *TextView.Buffer, style: vaxis.Style, text: []const u8) !void {
+    const start = buffer.content.items.len;
+    try buffer.append(allocator, .{ .bytes = text });
+    const end = buffer.content.items.len;
+    try buffer.updateStyle(allocator, .{ .begin = start, .end = end, .style = style });
+}
+
+fn logSinkWrite(ctx: *anyopaque, msg: []const u8) void {
+    const state: *LogState = @ptrCast(@alignCast(ctx));
+    appendPlain(state.allocator, state.buffer, msg) catch {};
 }

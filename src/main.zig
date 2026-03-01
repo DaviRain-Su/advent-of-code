@@ -23,7 +23,7 @@ pub fn main() !void {
 
     if (prompt_opt) |prompt| {
         defer allocator.free(prompt);
-        App.runWithPrompt(allocator, &diagnostics, prompt, null) catch |err| {
+        App.runWithPrompt(allocator, &diagnostics, prompt, null, null) catch |err| {
             reportError(allocator, &diagnostics, err);
         };
     } else {
