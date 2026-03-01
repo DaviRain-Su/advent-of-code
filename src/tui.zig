@@ -302,7 +302,7 @@ fn submitPrompt(
     try appendMessage(allocator, &state.messages, .user, prompt);
     try appendMessage(allocator, &state.messages, .system, "Running prompt...");
 
-    render(&vx, writer, state) catch |err| {
+    render(vx, writer, state) catch |err| {
         state.log("render before runWithPrompt failed: {s}", .{@errorName(err)});
         diag.setf(.usage, "TUI render failed: {s}", .{@errorName(err)}) catch {};
         return error.TuiUnavailable;
@@ -619,6 +619,6 @@ fn logSinkWrite(ctx: *anyopaque, msg: []const u8) void {
     var it = std.mem.splitScalar(u8, msg, '\n');
     while (it.next()) |line| {
         if (line.len == 0) continue;
-        appendMessage(state.allocator, state.messages, .system, line) catch {};
+        appendMessage(state.allocator, &state.messages, .system, line) catch {};
     }
 }
