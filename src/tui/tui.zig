@@ -42,21 +42,14 @@ const RunWorkerContext = struct {
     allocator: std.mem.Allocator,
 };
 
-fn probeTTY() ?std.posix.E {
-    const path = "/dev/tty" ++ [_]u8{0};
+fn probeTTY() ?std.posix.OpenError {
+    const path = "/dev/tty";
     const flags: std.posix.O = .{ .ACCMODE = .RDWR };
-
-    while (true) {
-        const fd = std.c.open(path, flags);
-        if (fd >= 0) {
-            std.posix.close(@intCast(fd));
-            return null;
-        }
-
-        const err = std.posix.errno(fd);
-        if (err == .INTR) continue;
+    const fd = std.posix.open(path, flags, 0) catch |err| {
         return err;
-    }
+    };
+    std.posix.close(fd);
+    return null;
 }
 
 fn streamSinkWrite(ctx: *anyopaque, chunk: []const u8) anyerror!void {
@@ -219,7 +212,7 @@ pub fn run(allocator: std.mem.Allocator, diag: *ErrorReport) !void {
 
     if (builtin.os.tag != .windows) {
         if (probeTTY()) |err| {
-            controller.log("tui preflight failed open /dev/tty: {s}", .{@tagName(err)});
+            controller.log("tui preflight failed open /dev/tty: {s}", .{@errorName(err)});
             diag.setBorrowed(.usage, "TUI requires a controlling terminal (/dev/tty). Use -p for CLI mode.");
             return error.TuiUnavailable;
         }
