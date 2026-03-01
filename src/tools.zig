@@ -155,8 +155,16 @@ fn runBashCommand(allocator: std.mem.Allocator, diag: *ErrorReport, command: []c
         .argv = &argv,
         .max_output_bytes = max_output,
     }) catch |err| {
-        try diag.setf(.tool, "Bash command failed to run: {any}", .{err});
-        return error.ToolExecutionFailed;
+        switch (err) {
+            error.StdoutStreamTooLong, error.StderrStreamTooLong => {
+                try diag.setf(.tool, "Bash output exceeds size limit ({d} bytes)", .{max_output});
+                return error.TooLargeToolOutput;
+            },
+            else => {
+                try diag.setf(.tool, "Bash command failed to run: {any}", .{err});
+                return error.ToolExecutionFailed;
+            },
+        }
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -267,7 +275,13 @@ fn parseToolArgumentsToBash(allocator: std.mem.Allocator, diag: *ErrorReport, ar
     defer parsed_args.deinit();
 
     const args_obj = try Json.asObject(diag, parsed_args.value, "tool_arguments");
-    const command = try Json.asString(diag, try Json.field(diag, args_obj, Defaults.bash_command_param), "tool_arguments.command");
+    const command_raw = try Json.asString(diag, try Json.field(diag, args_obj, Defaults.bash_command_param), "tool_arguments.command");
+    const command = std.mem.trim(u8, command_raw, " \t\r\n");
+
+    if (command.len == 0) {
+        diag.setBorrowed(.tool, "Bash command is empty");
+        return error.InvalidToolArguments;
+    }
 
     return ToolBashArgs{ .command = try allocator.dupe(u8, command) };
 }
